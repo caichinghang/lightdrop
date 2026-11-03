@@ -41,6 +41,9 @@ export class Scheduler {
   sentTotal = 0;
   rate = DEFAULT_RATE;
   private lastAck?: { at: number; sent: number; recv: number };
+  private freshRate = false;
+  /** Rate samples since the last resetRate(). */
+  rateSamples = 0;
   lastAckAt = 0;
 
   constructor(
@@ -162,6 +165,13 @@ export class Scheduler {
     this.cursor = this.firstIncomplete;
   }
 
+  /** Start measuring the catch rate afresh (after a density change). */
+  resetRate() {
+    this.lastAck = undefined;
+    this.freshRate = true;
+    this.rateSamples = 0;
+  }
+
   /** Apply a receiver ACK (from sound or the data channel). */
   onAck(ack: Ack, now = performance.now()) {
     this.lastAckAt = now;
@@ -175,7 +185,9 @@ export class Scheduler {
       const dRecv = (ack.recvCount - this.lastAck.recv + 0x10000) & 0xffff;
       if (dSent > 20) {
         const r = Math.min(1, Math.max(0.05, dRecv / dSent));
-        this.rate = this.rate * 0.6 + r * 0.4;
+        this.rate = this.freshRate ? r : this.rate * 0.6 + r * 0.4;
+        this.freshRate = false;
+        this.rateSamples++;
       }
     }
     this.lastAck = { at: now, sent: this.sentTotal, recv: ack.recvCount };

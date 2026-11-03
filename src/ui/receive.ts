@@ -14,7 +14,15 @@ interface DecodeRes {
   boxes: number[][][];
   w: number;
   h: number;
+  ms?: number;
   error?: string;
+}
+
+interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
 }
 
 const ACK_EVERY_MS = 2500;
@@ -22,7 +30,7 @@ const ACK_EVERY_MS = 2500;
 const WIFI_GIVE_UP_MS = 30000;
 /** Decode attempts per second: full speed while codes are in view, slow while searching.
  *  This, plus fewer workers on phones, is what keeps the phone from heating up. */
-const SCAN_FPS_LOCKED = 20;
+const SCAN_FPS_LOCKED = 30;
 const SCAN_FPS_SEARCHING = 6;
 
 export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () => void } {
@@ -217,25 +225,58 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
   const grabCanvas = document.createElement("canvas");
   const grabCtx = grabCanvas.getContext("2d", { willReadFrequently: true })!;
 
-  async function grabFrame(): Promise<{ msg: object; transfer: Transferable[] } | null> {
+  // Region of interest: once codes have been found, only the area around them
+  // is decoded. A crop of a few hundred pixels decodes several times faster
+  // than the full 1080p frame, which is what lets the phone keep up with a
+  // dense stream (and keeps it cooler). Misses fall back to full frames.
+  let roi: Rect | undefined;
+  let roiMisses = 0;
+  let scanNo = 0;
+  let decodeMs = 0;
+  let lastBoxes: number[][][] = [];
+
+  async function grabFrame(crop: Rect | undefined): Promise<{ msg: object; transfer: Transferable[] } | null> {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) return null;
+    const r = crop ?? { x: 0, y: 0, w: vw, h: vh };
     if (bitmapOk) {
       try {
-        const bitmap = await createImageBitmap(video);
+        const bitmap = crop ? await createImageBitmap(video, r.x, r.y, r.w, r.h) : await createImageBitmap(video);
         return { msg: { bitmap }, transfer: [bitmap] };
       } catch {
         bitmapOk = false;
       }
     }
-    const w = video.videoWidth;
-    const hgt = video.videoHeight;
-    if (!w || !hgt) return null;
-    if (grabCanvas.width !== w || grabCanvas.height !== hgt) {
-      grabCanvas.width = w;
-      grabCanvas.height = hgt;
+    if (grabCanvas.width !== r.w || grabCanvas.height !== r.h) {
+      grabCanvas.width = r.w;
+      grabCanvas.height = r.h;
     }
-    grabCtx.drawImage(video, 0, 0);
-    const buf = grabCtx.getImageData(0, 0, w, hgt).data.buffer;
-    return { msg: { buf, w, h: hgt }, transfer: [buf] };
+    grabCtx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+    const buf = grabCtx.getImageData(0, 0, r.w, r.h).data.buffer;
+    return { msg: { buf, w: r.w, h: r.h }, transfer: [buf] };
+  }
+
+  function roiFrom(boxes: number[][][]): Rect | undefined {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!boxes.length || !vw) return undefined;
+    const xs = boxes.flat().map((p) => p[0]!);
+    const ys = boxes.flat().map((p) => p[1]!);
+    const x0 = Math.min(...xs);
+    const y0 = Math.min(...ys);
+    const x1 = Math.max(...xs);
+    const y1 = Math.max(...ys);
+    // Generous margin: hands move, and grid neighbours may sit just outside.
+    const mx = (x1 - x0) * 0.3 + 24;
+    const my = (y1 - y0) * 0.3 + 24;
+    const x = Math.max(0, Math.floor(x0 - mx));
+    const y = Math.max(0, Math.floor(y0 - my));
+    const w = Math.min(vw, Math.ceil(x1 + mx)) - x;
+    const h = Math.min(vh, Math.ceil(y1 + my)) - y;
+    // Not worth it when the codes already fill most of the frame.
+    if (w * h > vw * vh * 0.7) return undefined;
+    return { x, y, w, h };
   }
 
   function grabLoop() {
@@ -250,13 +291,16 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
       if (now - lastGrab < 1000 / (locked ? SCAN_FPS_LOCKED : SCAN_FPS_SEARCHING)) return;
       lastGrab = now;
       grabbing = true;
-      grabFrame()
+      // Every 10th scan looks at the whole frame, in case codes moved or a grid
+      // code sits outside the crop.
+      const crop = roi && ++scanNo % 10 !== 0 ? roi : undefined;
+      grabFrame(crop)
         .then((f) => {
           if (!f) return;
           const job = decoders.tryRun({ ...f.msg, maxSymbols: 6 }, f.transfer);
           if (!job) return (f.msg as { bitmap?: ImageBitmap }).bitmap?.close();
           scans++;
-          void job.then(onDecoded);
+          void job.then((r) => onDecoded(r, crop));
         })
         .catch((e) => (grabError = String(e)))
         .finally(() => (grabbing = false));
@@ -268,30 +312,45 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     schedule();
   }
 
-  function onDecoded(r: DecodeRes) {
+  function onDecoded(r: DecodeRes, crop: Rect | undefined) {
     if (disposed) return;
     if (r.error) grabError = r.error;
+    if (r.ms) decodeMs = decodeMs ? decodeMs * 0.8 + r.ms * 0.2 : r.ms;
     codesSeen += r.codes.length;
     for (const c of r.codes) rx.onFrame(c);
-    if (r.codes.length) lastDecodeAt = performance.now();
-    drawBoxes(r);
+    const boxes = r.boxes.map((b) => b.map(([x, y]) => [x! + (crop?.x ?? 0), y! + (crop?.y ?? 0)]));
+    if (r.codes.length) {
+      lastDecodeAt = performance.now();
+      // A full frame that sees at least as many codes re-anchors the crop.
+      if (!crop || boxes.length >= lastBoxes.length) {
+        lastBoxes = boxes;
+        roi = roiFrom(boxes);
+      }
+      roiMisses = 0;
+    } else if (crop && ++roiMisses >= 3) {
+      roi = undefined;
+      lastBoxes = [];
+    }
+    drawBoxes(boxes);
   }
 
-  function drawBoxes(r: DecodeRes) {
+  function drawBoxes(boxes: number[][][]) {
     const rect = video.getBoundingClientRect();
     if (overlay.width !== rect.width || overlay.height !== rect.height) {
       overlay.width = rect.width;
       overlay.height = rect.height;
     }
     octx.clearRect(0, 0, overlay.width, overlay.height);
-    if (!r.w) return;
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw) return;
     // object-fit: cover mapping
-    const s = Math.max(rect.width / r.w, rect.height / r.h);
-    const dx = (rect.width - r.w * s) / 2;
-    const dy = (rect.height - r.h * s) / 2;
+    const s = Math.max(rect.width / vw, rect.height / vh);
+    const dx = (rect.width - vw * s) / 2;
+    const dy = (rect.height - vh * s) / 2;
     octx.strokeStyle = "rgba(34, 211, 238, 0.9)";
     octx.lineWidth = 3;
-    for (const box of r.boxes) {
+    for (const box of boxes) {
       octx.beginPath();
       box.forEach(([x, y], i) => (i ? octx.lineTo(x! * s + dx, y! * s + dy) : octx.moveTo(x! * s + dx, y! * s + dy)));
       octx.closePath();
@@ -315,7 +374,7 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
       lastCodes = codesSeen;
       diag.textContent = [
         camInfo && `camera ${camInfo}`,
-        `${scanRate.toFixed(0)} scans/s`,
+        `${scanRate.toFixed(0)} scans/s${decodeMs ? ` (${decodeMs.toFixed(0)} ms${roi ? ", crop" : ""})` : ""}`,
         `${codeRate.toFixed(0)} codes/s`,
         rx.totalFrames ? `${rx.usefulFrames} useful` : "",
         bitmapOk ? "" : "readback",

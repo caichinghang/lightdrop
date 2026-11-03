@@ -1,5 +1,5 @@
 import { crc32 } from "../core/crc";
-import { LADDER, frameLenFor, type Level } from "../core/density";
+import { LADDER, frameLenFor, levelRate, type Level } from "../core/density";
 import { DATA_HEADER, encodeData, encodeMeta, encodeSignal, signalChunkCapacity } from "../core/frame";
 import { Scheduler } from "../core/scheduler";
 import { SoundListener } from "../audio/io";
@@ -175,6 +175,7 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
     }
     queue.length = 0;
     lastLevelChange = performance.now();
+    sched.resetRate();
     levelLabel.textContent = `${auto ? "Auto · " : ""}${level.label} — ${level.codes}× QR v${level.version} at ${level.fps} fps`;
   }
 
@@ -259,12 +260,27 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
     .then(() => cSound.set("wait", "Listening"))
     .catch(() => cSound.set("off", "Mic off — no feedback"));
 
+  // Auto density: hill-climb on measured goodput (catch rate × raw rate of the
+  // level), not on the catch rate itself. A phone that decodes 15 scans/s
+  // catches a small share of a dense stream, yet gets far more bytes from it.
+  const goodput = new Map<number, number>();
+  let ceiling = { idx: LADDER.length, until: 0 };
   function onAck() {
     if (sched.finished) return finish();
     if (!auto) return;
-    const since = performance.now() - lastLevelChange;
-    if (sched.rate > 0.8 && since > 8000 && levelIdx < LADDER.length - 1) setLevel(levelIdx + 1);
-    else if (sched.rate < 0.35 && since > 5000 && levelIdx > 0) setLevel(levelIdx - 1);
+    const now = performance.now();
+    if (now - lastLevelChange < 5000 || sched.rateSamples < 1) return;
+    const g = sched.rate * levelRate(level);
+    goodput.set(levelIdx, g);
+    const below = goodput.get(levelIdx - 1);
+    if (below !== undefined && g < below * 0.9) {
+      // Going up made things worse: step back and don't retry for a minute.
+      ceiling = { idx: levelIdx, until: now + 60000 };
+      return setLevel(levelIdx - 1);
+    }
+    const blocked = levelIdx + 1 >= ceiling.idx && now < ceiling.until;
+    if (levelIdx + 1 < LADDER.length && !blocked && sched.rate > 0.08) return setLevel(levelIdx + 1);
+    if (sched.rate < 0.04 && levelIdx > 0) setLevel(levelIdx - 1);
   }
 
   function finish() {

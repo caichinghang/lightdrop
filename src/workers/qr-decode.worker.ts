@@ -22,6 +22,7 @@ self.onmessage = async (e: MessageEvent) => {
   };
   try {
     await ready;
+    const t0 = performance.now();
     let img: ImageData;
     if (bitmap) {
       if (!canvas || canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
@@ -45,7 +46,8 @@ self.onmessage = async (e: MessageEvent) => {
     const boxes = results
       .filter((r) => r.isValid)
       .map((r) => [r.position.topLeft, r.position.topRight, r.position.bottomRight, r.position.bottomLeft].map((p) => [p.x, p.y]));
-    (self as unknown as Worker).postMessage({ id, codes, boxes, w: img.width, h: img.height }, codes.map((c) => c.buffer));
+    const ms = performance.now() - t0;
+    (self as unknown as Worker).postMessage({ id, codes, boxes, w: img.width, h: img.height, ms }, codes.map((c) => c.buffer));
   } catch (err) {
     (self as unknown as Worker).postMessage({ id, error: String(err), codes: [], boxes: [] });
   }
