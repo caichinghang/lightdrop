@@ -15,7 +15,7 @@ for (let i = 0; i < size; i += 65536) crypto.getRandomValues(bytes.subarray(i, i
 const file = new File([bytes], `e2e-${size}.bin`, { lastModified: Date.now() });
 
 const senderBox = document.createElement("div");
-senderBox.style.cssText = "position:fixed;left:0;top:0;width:700px;height:520px;overflow:hidden;opacity:0.01;pointer-events:none";
+senderBox.style.cssText = "position:fixed;left:0;top:0;width:1400px;height:820px;overflow:hidden;opacity:0.01;pointer-events:none";
 document.body.append(senderBox);
 const s = sendView(file, () => {});
 senderBox.append(s.el);
@@ -24,7 +24,7 @@ if (level) {
   sel.value = level;
   sel.dispatchEvent(new Event("change"));
 }
-const qr = s.el.querySelector("canvas.qr") as HTMLCanvasElement;
+const qr = s.el.querySelector("canvas.code") as HTMLCanvasElement;
 
 const cam = document.createElement("canvas");
 cam.width = 1280;
@@ -34,9 +34,15 @@ setInterval(() => {
   cx.fillStyle = "#555";
   cx.fillRect(0, 0, 1280, 720);
   if (!qr.width) return;
-  const scale = Math.min(560 / qr.width, 560 / qr.height);
-  cx.imageSmoothingEnabled = true; // blurry like a camera
-  cx.drawImage(qr, 420, 80, qr.width * scale, qr.height * scale);
+  // Fill most of the frame, slightly rotated and soft, like a hand-held phone.
+  const scale = Math.min(1100 / qr.width, 640 / qr.height);
+  cx.save();
+  cx.translate(640, 360);
+  cx.rotate(0.03);
+  cx.imageSmoothingEnabled = true;
+  cx.filter = "blur(0.6px)";
+  cx.drawImage(qr, (-qr.width * scale) / 2, (-qr.height * scale) / 2, qr.width * scale, qr.height * scale);
+  cx.restore();
 }, 1000 / 30);
 const stream = cam.captureStream(30);
 navigator.mediaDevices.getUserMedia = async () => stream;
@@ -46,9 +52,9 @@ document.getElementById("app")!.append(r.el);
 const t0 = performance.now();
 (window as any).e2e = () => ({
   secs: (performance.now() - t0) / 1000,
-  pct: r.el.querySelector(".pct")?.textContent,
+  bar: r.el.querySelector(".bar")?.textContent,
   diag: r.el.querySelector(".diag")?.textContent,
-  sub: r.el.querySelector(".sheet .muted")?.textContent,
+  sub: r.el.querySelector(".file-meta span")?.textContent,
   done: !r.el.querySelector(".result")?.hasAttribute("hidden"),
-  sender: s.el.querySelector(".row")?.textContent,
+  sender: s.el.querySelector(".level")?.textContent,
 });

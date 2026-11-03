@@ -1,22 +1,31 @@
 # Lightdrop
 
-Send a file from one screen to another device's camera — no pairing, no app,
-no network required. Two things make it different from QR-stream tools like
-decimen or txqr:
+Send a file from one screen to another device's camera: no pairing, no app,
+no network required.
 
-1. **Sound back-channel.** The receiver's speaker chirps short ACKs to the
-   sender's microphone (~100 bit/s). The sender stops repeating segments that
-   have already arrived, and speeds up or slows down the QR stream based on how
-   many codes the camera actually catches.
-2. **Automatic Wi-Fi upgrade.** The sender's WebRTC offer rides inside the QR
-   stream; the receiver's answer is squeezed to 57 bytes and sent back by sound.
-   If both devices can reach each other (same Wi-Fi or hotspot), the rest of the
-   file moves over a direct data channel. Nobody taps "connect".
+**Live:** https://caichinghang.github.io/lightdrop/ (open it on both devices).
 
-If there is no microphone or no shared network, it degrades to a plain
-one-way optical stream.
+What's different from QR-stream tools like decimen, txqr or cimbar:
 
-**Live:** https://caichinghang.github.io/lightdrop/ — open it on both devices.
+1. **A custom optical code instead of QR.** Each frame is a single large
+   black-and-white grid. Four finders locate it, and a lattice of alignment
+   marks corrects lens distortion. The data is carried as many *independent*
+   Reed–Solomon blocks, each a horizontal band with its own label. A blurry
+   corner costs only the blocks in that corner. A capture torn by the screen
+   refresh (half one frame, half the next) still yields good blocks from both
+   frames. Decoding is plain sampling, about 15 ms per 720p frame in a desktop
+   browser.
+2. **Sound back-channel.** The receiver's speaker chirps short ACKs to the
+   sender's microphone (~100 bit/s). The sender stops repeating finished
+   segments, and Auto raises the density for as long as throughput keeps
+   improving.
+3. **Automatic Wi-Fi upgrade.** The sender's WebRTC offer rides inside the
+   optical stream, and the receiver's 57-byte answer goes back by sound. If
+   both devices can reach each other, the rest moves over a direct data
+   channel. This can be switched off for school or office networks.
+
+The interface is 1-bit: black ink, white paper, pixel fonts, and pixel art
+drawn from text maps.
 
 ## Run
 
@@ -36,28 +45,26 @@ into the real decoder and receiver (no camera needed).
 
 | Piece | File | Notes |
 |---|---|---|
-| Frame format | `src/core/frame.ts` | Self-describing 24-byte header; DATA / META / SIGNAL frames |
-| Segments | `src/core/segments.ts` | File cut into 256 KiB segments, coded independently → no file-size cap, flat memory |
-| Fountain code | `src/core/fountain.ts` | Systematic random linear code over GF(2); any ~k+2 frames rebuild a segment |
-| Scheduler | `src/core/scheduler.ts` | Picks which segment to show next; uses ACKs to skip finished ones |
-| Receiver | `src/core/receiver.ts` | Gaussian elimination per segment, CRC-32 check, writes to disk |
+| Optical code | `src/optical/` | Layout, encoder, detector (finders → size/orientation search → mesh → sampling), RS(255,223) |
+| Block format | `src/core/frame.ts` | Self-describing 223-byte blocks: DATA / META / SIGNAL |
+| Segments | `src/core/segments.ts` | File cut into 128 KiB segments, coded independently, so file size is unlimited and memory use stays flat |
+| Fountain code | `src/core/fountain.ts` | Systematic random linear code over GF(2); any ~k+2 blocks rebuild a segment |
+| Scheduler | `src/core/scheduler.ts` | Picks which segment to send next; uses ACKs to skip finished ones |
+| Receiver | `src/core/receiver.ts` | Gaussian elimination per segment, writes finished segments to disk |
 | Storage | `src/storage/` | OPFS via sync access handle in a worker; resumable via a manifest |
 | Audio modem | `src/audio/modem.ts` | 17-tone differential MFSK, 2–4.4 kHz, sync tones + CRC-16 |
-| Wi-Fi | `src/net/rtc.ts`, `src/net/wire.ts` | Compact answer (ufrag, pwd, fingerprint); raw segments over the data channel |
-| QR | `src/workers/` | `qrcode` with pinned mask for encoding; `zxing-wasm` for decoding |
+| Wi-Fi | `src/net/` | Compact answer (ufrag, pwd, fingerprint); raw segments over the data channel |
+| UI | `src/ui/` | 1-bit windows, pixel sprites (`pixels.ts`), ASCII status |
 
 ## Status
 
 Verified:
-- Unit tests: fountain decoding under loss, end-to-end scheduling with and
-  without ACKs, mid-transfer density change, audio modem through a simulated
-  noisy, echoing channel.
-- Browser loopback: 1.5 MB through real QR encode → canvas → zxing → fountain
-  → OPFS, byte-exact.
-- WebRTC from the 57-byte compact answer opens a data channel in Chrome.
+- `npm test`: fountain code, scheduler with and without ACKs, audio modem
+  through a simulated noisy room, Reed–Solomon, and the optical detector on
+  synthetic photos with tilt, lens barrel, blur, noise, 90°/180° rotation and
+  torn frames.
+- `/e2e.html`: the real receive screen fed by a simulated 720p camera.
+  HYPER level reached ~190 KB/s; a 2 MB file arrived byte-exact.
 
-Not yet verified on real devices:
-- Camera capture on iOS/Android, and the acoustic link through a real speaker
-  and microphone.
-- WebRTC across two devices using mDNS (`.local`) candidates — the default in
-  browsers. This could not be tested in the sandbox.
+Not yet verified on real devices: speed with a real phone camera, and the
+acoustic link through a real speaker and microphone.

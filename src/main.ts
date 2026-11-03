@@ -1,60 +1,71 @@
+import "@fontsource/vt323";
+import "@fontsource/silkscreen";
 import "./style.css";
 import { pickFileView, sendView } from "./ui/send";
 import { receiveView } from "./ui/receive";
 import { deleteSaved, doneFraction, listSaved, opfs, type SavedTransfer } from "./storage/store";
-import { formatBytes, h, icons, svg } from "./ui/util";
+import { asciiBar, beam, sprite } from "./ui/pixels";
+import { formatBytes, h, win } from "./ui/util";
 
 const app = document.getElementById("app")!;
 let dispose: (() => void) | undefined;
 
-function show(el: HTMLElement, cleanup?: () => void) {
+function menubar(): HTMLElement {
+  const clock = h("span", { class: "mb-clock" });
+  const tick = () => (clock.textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+  tick();
+  setInterval(tick, 15000);
+  const home = h("button", { class: "mb-brand" }, "◆ LIGHTDROP");
+  home.onclick = () => (location.hash = "");
+  return h("nav", { class: "menubar" }, home, h("span", { class: "mb-item" }, "FILE"), h("span", { class: "mb-item" }, "HELP"), h("span", { class: "spacer" }), clock);
+}
+const bar = menubar();
+
+function show(el: HTMLElement, cleanup?: () => void, withBar = true) {
   dispose?.();
   dispose = cleanup;
-  app.replaceChildren(el);
+  app.replaceChildren(...(withBar ? [bar, el] : [el]));
 }
 
 function home() {
-  const sendCard = h(
-    "button",
-    { class: "card send-card" },
-    svg(icons.send, "icon lg"),
-    h("strong", {}, "Send"),
-    h("span", {}, "Show a file as moving codes"),
-  );
-  const recvCard = h(
-    "button",
-    { class: "card recv-card" },
-    svg(icons.receive, "icon lg"),
-    h("strong", {}, "Receive"),
-    h("span", {}, "Point your camera at the codes"),
-  );
-  sendCard.onclick = () => (location.hash = "#send");
-  recvCard.onclick = () => (location.hash = "#receive");
+  const b = beam(window.innerWidth < 520 ? 8 : 16);
+  const hero = h("div", { class: "hero" }, sprite("computer", window.innerWidth < 520 ? 4 : 5), b.el, sprite("phone", window.innerWidth < 520 ? 4 : 5));
 
-  const saved = h("section", { class: "saved" });
-  const el = h(
-    "div",
-    { class: "page home" },
-    h("div", { class: "brand" }, h("img", { src: `${import.meta.env.BASE_URL}icon.svg`, alt: "", width: "40", height: "40" }), h("h1", {}, "Lightdrop")),
-    h("p", { class: "tagline" }, "Move files between any two devices with a screen and a camera. No pairing, no cables, no internet."),
-    h("div", { class: "cards" }, sendCard, recvCard),
-    saved,
+  const sendBtn = h("button", { class: "big-btn" }, sprite("floppy", 4), h("span", {}, h("strong", {}, "SEND"), h("small", {}, "show a file as light")));
+  const recvBtn = h("button", { class: "big-btn" }, sprite("camera", 4), h("span", {}, h("strong", {}, "RECEIVE"), h("small", {}, "point your camera")));
+  sendBtn.onclick = () => (location.hash = "#send");
+  recvBtn.onclick = () => (location.hash = "#receive");
+
+  const main = win(
+    "LIGHTDROP",
+    { cls: "win-main" },
+    hero,
+    h("h1", { class: "title" }, "LIGHTDROP"),
+    h("p", { class: "tagline" }, "Files through the air. Screen to camera.", h("br"), "No pairing. No cables. No internet."),
+    h("div", { class: "big-btns" }, sendBtn, recvBtn),
+  );
+  const how = win(
+    "HOW IT WORKS",
+    { cls: "win-how" },
     h(
       "ul",
       { class: "how" },
-      h("li", {}, svg(icons.light), h("span", {}, h("b", {}, "Light"), " carries the file, frame by frame.")),
-      h("li", {}, svg(icons.sound), h("span", {}, h("b", {}, "Sound"), " lets the receiver report back, so nothing is sent twice.")),
-      h("li", {}, svg(icons.wifi), h("span", {}, h("b", {}, "Wi-Fi"), " takes over automatically when both are on the same network.")),
+      h("li", {}, sprite("sun", 3), h("span", {}, h("b", {}, "LIGHT"), " carries the file as a pattern of black and white blocks.")),
+      h("li", {}, sprite("speaker", 3), h("span", {}, h("b", {}, "SOUND"), " lets the receiver chirp back what it still needs.")),
+      h("li", {}, sprite("wifi", 3), h("span", {}, h("b", {}, "WI-FI"), " takes over by itself when both share a network.")),
     ),
   );
-  // Desktop: drop anywhere on the home screen to send.
+  const saved = h("div", { class: "saved-slot" });
+  const side = h("div", { class: "side" }, saved, how);
+  const el = h("div", { class: "desk home" }, main, side);
+  // Desktop: drop a file anywhere on the home screen to send it.
   el.addEventListener("dragover", (e) => e.preventDefault());
   el.addEventListener("drop", (e) => {
     e.preventDefault();
     const f = e.dataTransfer?.files[0];
     if (f) startSend(f);
   });
-  show(el);
+  show(el, () => b.stop());
   void renderSaved(saved);
 }
 
@@ -64,41 +75,40 @@ async function renderSaved(into: HTMLElement) {
     items = await listSaved();
   } catch {}
   if (!items.length) return;
-  const list = h("ul", { class: "saved-list" });
-  for (const t of items.slice(0, 8)) {
+  const list = h("ul", { class: "files" });
+  for (const t of items.slice(0, 5)) {
     const frac = doneFraction(t);
     const done = frac >= 1;
-    const del = h("button", { class: "icon-btn small", "aria-label": "Delete" }, svg(icons.close));
+    const del = h("button", { class: "linkish", "aria-label": "Delete" }, "[X]");
+    const action = h("button", { class: "btn small" }, done ? "SAVE" : "RESUME");
+    const li = h(
+      "li",
+      {},
+      sprite("file", 2),
+      h(
+        "div",
+        { class: "file-meta" },
+        h("strong", { class: "ellipsis" }, t.name || "UNNAMED"),
+        h("span", {}, done ? `${formatBytes(t.totalSize)} · received` : `${asciiBar(frac, 8)} paused`),
+      ),
+      action,
+      del,
+    );
     del.onclick = async () => {
       await deleteSaved(t.fileId);
       li.remove();
     };
-    const action = done ? h("button", { class: "btn small" }, "Save") : h("button", { class: "btn small" }, "Resume");
     action.onclick = async () => {
       if (!done) return void (location.hash = "#receive");
       const root = await navigator.storage.getDirectory();
       const dir = await root.getDirectoryHandle("incoming");
       const raw = await (await dir.getFileHandle(`${(t.fileId >>> 0).toString(16).padStart(8, "0")}.part`)).getFile();
       const file = new File([raw.slice(0, t.totalSize)], t.name, { type: t.mime });
-      const a = h("a", { href: URL.createObjectURL(file), download: t.name });
-      a.click();
+      h("a", { href: URL.createObjectURL(file), download: t.name }).click();
     };
-    const li = h(
-      "li",
-      {},
-      svg(icons.file),
-      h(
-        "div",
-        { class: "file-meta" },
-        h("strong", { class: "ellipsis" }, t.name || "Unnamed file"),
-        h("span", { class: "muted" }, done ? `${formatBytes(t.totalSize)} · received` : `${Math.floor(frac * 100)}% of ${formatBytes(t.totalSize)} · paused`),
-      ),
-      action,
-      del,
-    );
     list.append(li);
   }
-  into.replaceChildren(h("h3", {}, "On this device"), list);
+  into.replaceChildren(win("ON THIS DEVICE", { cls: "win-files" }, list));
 }
 
 let pendingFile: File | undefined;
@@ -116,13 +126,13 @@ function route() {
   if (location.hash === "#send") {
     if (pendingFile) {
       const v = sendView(pendingFile, back);
-      return show(v.el, v.dispose);
+      return show(v.el, v.dispose, false);
     }
     return show(pickFileView(startSend, back));
   }
   if (location.hash === "#receive") {
     const v = receiveView(back);
-    return show(v.el, v.dispose);
+    return show(v.el, v.dispose, false);
   }
   home();
 }

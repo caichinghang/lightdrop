@@ -62,7 +62,7 @@ export class Receiver {
   }
 
   /** Like `progress`, but also credits segments that are partly decoded, so
-   *  the number moves frame by frame instead of every 256 KiB. */
+   *  the number moves frame by frame instead of every segment. */
   get smoothProgress(): number {
     if (!this.info) return 0;
     let partial = 0;
@@ -152,7 +152,8 @@ export class Receiver {
       }
       return;
     }
-    if (!this.accept(f.fileId, f.totalSize)) return;
+    // Data blocks don't carry the file size; they count once META has locked us on.
+    if (this.info?.fileId !== f.fileId) return;
     this.onData(f);
   }
 
@@ -175,9 +176,8 @@ export class Receiver {
     this.lastUseful = performance.now();
     if (d.complete) {
       this.decoders.delete(f.seg);
-      const bytes = d.solve();
-      if (crc32(bytes) !== f.segCrc) return; // corrupt frame slipped through; segment restarts
-      this.finishSegment(f.seg, bytes);
+      // Every block passed its own Reed–Solomon check, so no segment CRC here.
+      this.finishSegment(f.seg, d.solve());
     }
     this.events.onProgress?.();
   }

@@ -1,22 +1,21 @@
-// Optical frame format. Every QR code is self-describing: a receiver can lock
-// on mid-stream with no handshake. All frames in a stream are padded to the
-// same length so every QR code has the same version (needed for the grid).
+// Block format. Each optical frame carries many independent 223-byte blocks
+// (one RS codeword each). Every block is self-describing, so blocks from a
+// torn capture — half one frame, half the next — are all usable.
 //
-//  0  u8   magic 0x4C ('L')
-//  1  u8   magic 0xD7
-//  2  u8   version << 4 | type
-//  3  u8   flags (reserved, 0)
-//  4  u32  fileId     stable per file (name+size+mtime), so resume survives restarts
-//  8  ...  type-specific
+//  0  u8   version << 4 | type
+//  1  u24  fileId (stable per file, so resume survives restarts)
 //
-// DATA   (type 1)  8 u32 seg · 12 u16 seq · 14 u32 segCrc · 18 u48 totalSize · 24 payload
-// META   (type 2)  8 u48 totalSize · 14 u8 nameLen · name · u8 typeLen · type
-// SIGNAL (type 3)  8 u16 offerId · 10 u8 part · 11 u8 parts · 12 u16 len · 14 deflated SDP chunk
+// DATA   (type 1)  4 u24 seg · 7 u16 seq · 9 payload (212 bytes)
+// META   (type 2)  4 u48 totalSize · 10 u8 nameLen · name · u8 mimeLen · mime
+// SIGNAL (type 3)  4 u16 offerId · 6 u8 part · 7 u8 parts · 8 u8 len · 9 deflated SDP chunk
 
-export const MAGIC0 = 0x4c;
-export const MAGIC1 = 0xd7;
-export const VERSION = 1;
-export const DATA_HEADER = 24;
+import { BLOCK_DATA } from "../optical/layout";
+
+export const VERSION = 2;
+export const DATA_HEADER = 9;
+/** Fountain block size: fixed, whatever the stream density. */
+export const PAYLOAD_LEN = 212;
+export const SIGNAL_CHUNK = BLOCK_DATA - 9;
 
 export const enum FrameType {
   Data = 1,
@@ -29,8 +28,6 @@ export interface DataFrame {
   fileId: number;
   seg: number;
   seq: number;
-  segCrc: number;
-  totalSize: number;
   payload: Uint8Array;
 }
 export interface MetaFrame {
@@ -53,57 +50,44 @@ export type Frame = DataFrame | MetaFrame | SignalFrame;
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-function header(out: Uint8Array, type: FrameType, fileId: number): DataView {
-  const v = new DataView(out.buffer, out.byteOffset, out.byteLength);
-  out[0] = MAGIC0;
-  out[1] = MAGIC1;
-  out[2] = (VERSION << 4) | type;
-  out[3] = 0;
-  v.setUint32(4, fileId >>> 0, true);
-  return v;
-}
+export const fileId24 = (id: number) => id & 0xffffff;
 
-function setU48(v: DataView, at: number, n: number) {
-  v.setUint32(at, n % 0x100000000, true);
-  v.setUint16(at + 4, Math.floor(n / 0x100000000), true);
+function u24(b: Uint8Array, at: number, v: number) {
+  b[at] = v & 0xff;
+  b[at + 1] = (v >>> 8) & 0xff;
+  b[at + 2] = (v >>> 16) & 0xff;
 }
-function getU48(v: DataView, at: number): number {
-  return v.getUint32(at, true) + v.getUint16(at + 4, true) * 0x100000000;
-}
+const getU24 = (b: Uint8Array, at: number) => b[at]! | (b[at + 1]! << 8) | (b[at + 2]! << 16);
 
-export function encodeData(
-  frameLen: number,
-  fileId: number,
-  seg: number,
-  seq: number,
-  segCrc: number,
-  totalSize: number,
-  payload: Uint8Array,
-): Uint8Array {
-  const out = new Uint8Array(frameLen);
-  const v = header(out, FrameType.Data, fileId);
-  v.setUint32(8, seg, true);
-  v.setUint16(12, seq, true);
-  v.setUint32(14, segCrc >>> 0, true);
-  setU48(v, 18, totalSize);
-  out.set(payload.subarray(0, frameLen - DATA_HEADER), DATA_HEADER);
+function header(type: FrameType, fileId: number): Uint8Array {
+  const out = new Uint8Array(BLOCK_DATA);
+  out[0] = (VERSION << 4) | type;
+  u24(out, 1, fileId24(fileId));
   return out;
 }
 
-export function encodeMeta(frameLen: number, fileId: number, totalSize: number, name: string, mime: string): Uint8Array {
-  const out = new Uint8Array(frameLen);
-  const v = header(out, FrameType.Meta, fileId);
-  setU48(v, 8, totalSize);
-  // Truncate on a byte budget that always fits the smallest frame size.
-  const budget = Math.max(16, frameLen - 16);
-  const mimeBytes = enc.encode(mime).subarray(0, Math.min(100, budget >> 2));
+export function encodeData(fileId: number, seg: number, seq: number, payload: Uint8Array): Uint8Array {
+  const out = header(FrameType.Data, fileId);
+  u24(out, 4, seg);
+  out[7] = seq & 0xff;
+  out[8] = seq >>> 8;
+  out.set(payload.subarray(0, PAYLOAD_LEN), DATA_HEADER);
+  return out;
+}
+
+export function encodeMeta(fileId: number, totalSize: number, name: string, mime: string): Uint8Array {
+  const out = header(FrameType.Meta, fileId);
+  const v = new DataView(out.buffer);
+  v.setUint32(4, totalSize % 0x100000000, true);
+  v.setUint16(8, Math.floor(totalSize / 0x100000000), true);
+  const mimeBytes = enc.encode(mime).subarray(0, 60);
   let nameBytes = enc.encode(name);
-  const nameMax = Math.min(255, budget - mimeBytes.length);
+  const nameMax = BLOCK_DATA - 12 - mimeBytes.length;
   if (nameBytes.length > nameMax) nameBytes = enc.encode(truncateUtf8(name, nameMax));
-  out[14] = nameBytes.length;
-  out.set(nameBytes, 15);
-  out[15 + nameBytes.length] = mimeBytes.length;
-  out.set(mimeBytes, 16 + nameBytes.length);
+  out[10] = nameBytes.length;
+  out.set(nameBytes, 11);
+  out[11 + nameBytes.length] = mimeBytes.length;
+  out.set(mimeBytes, 12 + nameBytes.length);
   return out;
 }
 
@@ -116,69 +100,41 @@ function truncateUtf8(s: string, maxBytes: number): string {
   return base + "…" + ext;
 }
 
-export function signalChunkCapacity(frameLen: number): number {
-  return frameLen - 14;
-}
-
-export function encodeSignal(
-  frameLen: number,
-  fileId: number,
-  offerId: number,
-  part: number,
-  parts: number,
-  chunk: Uint8Array,
-): Uint8Array {
-  const out = new Uint8Array(frameLen);
-  const v = header(out, FrameType.Signal, fileId);
-  v.setUint16(8, offerId, true);
-  out[10] = part;
-  out[11] = parts;
-  v.setUint16(12, chunk.length, true);
-  out.set(chunk, 14);
+export function encodeSignal(fileId: number, offerId: number, part: number, parts: number, chunk: Uint8Array): Uint8Array {
+  const out = header(FrameType.Signal, fileId);
+  out[4] = offerId & 0xff;
+  out[5] = offerId >>> 8;
+  out[6] = part;
+  out[7] = parts;
+  out[8] = chunk.length;
+  out.set(chunk.subarray(0, SIGNAL_CHUNK), 9);
   return out;
 }
 
 export function parseFrame(bytes: Uint8Array): Frame | null {
-  if (bytes.length < 16 || bytes[0] !== MAGIC0 || bytes[1] !== MAGIC1) return null;
-  if (bytes[2]! >> 4 !== VERSION) return null;
-  const type = bytes[2]! & 0x0f;
-  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const fileId = v.getUint32(4, true);
+  if (bytes.length < BLOCK_DATA || bytes[0]! >> 4 !== VERSION) return null;
+  const type = bytes[0]! & 0x0f;
+  const fileId = getU24(bytes, 1);
   if (type === FrameType.Data) {
-    if (bytes.length <= DATA_HEADER) return null;
-    return {
-      type,
-      fileId,
-      seg: v.getUint32(8, true),
-      seq: v.getUint16(12, true),
-      segCrc: v.getUint32(14, true),
-      totalSize: getU48(v, 18),
-      payload: bytes.subarray(DATA_HEADER),
-    };
+    return { type, fileId, seg: getU24(bytes, 4), seq: bytes[7]! | (bytes[8]! << 8), payload: bytes.subarray(DATA_HEADER, DATA_HEADER + PAYLOAD_LEN) };
   }
   if (type === FrameType.Meta) {
-    const nameLen = bytes[14]!;
-    const mimeLen = bytes[15 + nameLen] ?? 0;
-    if (16 + nameLen + mimeLen > bytes.length) return null;
+    const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const nameLen = bytes[10]!;
+    const mimeLen = bytes[11 + nameLen] ?? 0;
+    if (12 + nameLen + mimeLen > bytes.length) return null;
     return {
       type,
       fileId,
-      totalSize: getU48(v, 8),
-      name: dec.decode(bytes.subarray(15, 15 + nameLen)),
-      mime: dec.decode(bytes.subarray(16 + nameLen, 16 + nameLen + mimeLen)),
+      totalSize: v.getUint32(4, true) + v.getUint16(8, true) * 0x100000000,
+      name: dec.decode(bytes.subarray(11, 11 + nameLen)),
+      mime: dec.decode(bytes.subarray(12 + nameLen, 12 + nameLen + mimeLen)),
     };
   }
   if (type === FrameType.Signal) {
-    const len = v.getUint16(12, true);
-    if (14 + len > bytes.length || bytes[11] === 0) return null;
-    return {
-      type,
-      fileId,
-      offerId: v.getUint16(8, true),
-      part: bytes[10]!,
-      parts: bytes[11]!,
-      chunk: bytes.subarray(14, 14 + len),
-    };
+    const len = bytes[8]!;
+    if (bytes[7] === 0 || len > SIGNAL_CHUNK) return null;
+    return { type, fileId, offerId: bytes[4]! | (bytes[5]! << 8), part: bytes[6]!, parts: bytes[7]!, chunk: bytes.subarray(9, 9 + len) };
   }
   return null;
 }

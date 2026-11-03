@@ -41,7 +41,7 @@ async function main() {
   const file = new File([bytes], `loopback-${size}.bin`, { type: "application/octet-stream", lastModified: Date.now() });
   const v = sendView(file, () => {});
   document.getElementById("app")!.append(v.el);
-  const canvas = v.el.querySelector("canvas.qr") as HTMLCanvasElement;
+  const canvas = v.el.querySelector("canvas.code") as HTMLCanvasElement;
   const sink = new FileSink();
   const t0 = performance.now();
   const rx = new Receiver(sink, {
@@ -54,21 +54,21 @@ async function main() {
     },
   });
   (window as any).rx = rx;
-  const pool = new WorkerPool<object, { codes: Uint8Array[] }>(
-    () => new Worker(new URL("../workers/qr-decode.worker.ts", import.meta.url), { type: "module" }),
+  const pool = new WorkerPool<object, { blocks: Uint8Array[] }>(
+    () => new Worker(new URL("../workers/optical-decode.worker.ts", import.meta.url), { type: "module" }),
     3,
   );
   let last = "";
   const grab = async () => {
     requestAnimationFrame(grab);
     if (!canvas.width || pool.idle === 0) return;
-    // Upscale ~3 px/module like a camera would see it.
-    const scale = Math.max(1, Math.floor(900 / canvas.width));
+    // Upscale to ~3 px/module, like a camera would see it.
+    const scale = 3;
     const bmp = await createImageBitmap(canvas, { resizeWidth: canvas.width * scale, resizeHeight: canvas.height * scale, resizeQuality: "pixelated" });
-    const job = pool.tryRun({ bitmap: bmp, maxSymbols: 6 }, [bmp]);
+    const job = pool.tryRun({ bitmap: bmp }, [bmp]);
     if (!job) return bmp.close();
     const r = await job;
-    for (const c of r.codes) rx.onFrame(c);
+    for (const b of r.blocks) rx.onFrame(b);
     const s = `${Math.floor(rx.progress * 100)}%`;
     if (s !== last) {
       last = s;
