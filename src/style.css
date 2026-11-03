@@ -212,6 +212,8 @@ small {
 
 .home {
   display: grid;
+  /* minmax(0, …): never let a long line widen the column past the screen */
+  grid-template-columns: minmax(0, 1fr);
   gap: 26px;
   align-content: start;
   max-width: 1080px;
@@ -219,13 +221,14 @@ small {
 }
 @media (min-width: 900px) {
   .home {
-    grid-template-columns: 1.4fr 1fr;
+    grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
     align-items: start;
     padding-top: 40px;
   }
 }
 .side {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 26px;
 }
 .hero {
@@ -382,6 +385,10 @@ small {
   height: 100dvh;
   background: var(--paper);
 }
+.send-layout:fullscreen {
+  width: 100vw;
+  height: 100vh;
+}
 .stage {
   position: relative;
   display: grid;
@@ -393,9 +400,6 @@ small {
 canvas.code {
   image-rendering: pixelated;
   image-rendering: crisp-edges;
-}
-.stage:fullscreen {
-  padding: 8px;
 }
 .stage-overlay {
   position: absolute;
@@ -420,40 +424,50 @@ canvas.code {
   padding: 2px 8px;
   background: var(--paper);
 }
-.win-panel {
-  margin: 0 8px calc(var(--safe-bottom) + 10px);
-  box-shadow: none;
+.strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 46px;
+  padding: 4px 10px calc(var(--safe-bottom) + 4px);
+  border-top: var(--px) solid var(--ink);
+  background: var(--paper);
+  overflow: hidden;
 }
-.win-panel .win-body {
-  gap: 8px;
-  padding: 10px 14px 12px;
+.strip-bar {
+  margin: 0;
+  font: inherit;
+  font-size: 20px;
+  white-space: pre;
 }
-.win-panel .settings {
-  order: 10;
+.strip-text {
+  font-size: 19px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
-@media (min-aspect-ratio: 5/4) and (min-width: 860px) {
-  .send-layout {
-    grid-template-rows: none;
-    grid-template-columns: 1fr 380px;
-  }
-  .stage {
-    padding: 16px;
-  }
-  .win-panel {
-    margin: 16px 16px 16px 0;
-    align-self: center;
-    box-shadow: 5px 5px 0 var(--ink);
-  }
-  .win-panel .win-body {
-    gap: 12px;
-    padding: 14px 16px 18px;
-  }
-}
-@media (max-height: 700px) and (max-aspect-ratio: 5/4) {
-  .win-panel .lines,
-  .win-panel .level {
+@media (max-width: 520px) {
+  .strip-text {
     display: none;
   }
+  .strip {
+    gap: 8px;
+  }
+}
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: var(--paper) var(--dither-50);
+}
+.win-panel {
+  width: min(100%, 440px);
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
 }
 
 .file-row {
@@ -590,7 +604,8 @@ canvas.code {
   inset: 0;
 }
 .camera,
-.camera-overlay {
+.camera-overlay,
+.camera-preview {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -598,61 +613,28 @@ canvas.code {
   object-fit: cover;
 }
 .camera {
-  filter: grayscale(1) contrast(1.35);
+  /* Kept playing (and sized) so frames keep coming; the preview replaces it. */
+  opacity: 0;
 }
-.reticle {
-  position: absolute;
-  left: 50%;
-  top: 38%;
-  width: min(82vw, 60vh);
-  aspect-ratio: 4 / 3;
-  transform: translate(-50%, -50%);
-  pointer-events: none;
+.camera-preview {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  background: var(--ink);
 }
-.reticle i {
-  position: absolute;
-  width: 36px;
-  height: 36px;
-  border: 5px solid var(--paper);
-  outline: var(--px) solid var(--ink);
-}
-.reticle i:nth-child(1) {
-  top: 0;
-  left: 0;
-  border-right: 0;
-  border-bottom: 0;
-}
-.reticle i:nth-child(2) {
-  top: 0;
-  right: 0;
-  border-left: 0;
-  border-bottom: 0;
-}
-.reticle i:nth-child(3) {
-  bottom: 0;
-  right: 0;
-  border-left: 0;
-  border-top: 0;
-}
-.reticle i:nth-child(4) {
-  bottom: 0;
-  left: 0;
-  border-right: 0;
-  border-top: 0;
-}
-.reticle.locked i {
-  animation: blink 0.5s steps(2) infinite;
+@keyframes blink-soft {
+  50% {
+    opacity: 0;
+  }
 }
 .aim-hint {
   position: absolute;
   left: 50%;
-  top: calc(38% + min(30vw, 22.5vh) + 22px);
+  top: calc(var(--safe-top) + 68px);
   transform: translateX(-50%);
-  width: min(88vw, 460px);
+  width: min(calc(100% - 24px), 460px);
   padding: 8px 12px;
   border: var(--px) solid var(--ink);
   background: var(--paper);
-  box-shadow: 4px 4px 0 var(--ink);
   font-family: var(--display);
   font-size: 13px;
   line-height: 1.4;
@@ -675,11 +657,22 @@ canvas.code {
   bottom: calc(var(--safe-bottom) + 10px);
   max-width: 560px;
   margin: 0 auto;
-  box-shadow: 5px 5px 0 var(--ink), 5px 5px 0 2px var(--paper);
+  box-shadow: none;
 }
 .win-sheet .win-body {
   gap: 6px;
   padding: 10px 14px 12px;
+}
+.lines.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+.sl.compact .sl-dots {
+  display: none;
+}
+.sl.compact {
+  font-size: 18px;
 }
 .diag {
   font-size: 16px;
@@ -696,9 +689,6 @@ canvas.code {
     right: 20px;
     bottom: 20px;
     width: 420px;
-  }
-  .reticle {
-    left: calc(50% - 220px);
   }
   .aim-hint {
     left: calc(50% - 220px);
@@ -734,4 +724,31 @@ canvas.code {
   display: grid;
   gap: 12px;
   margin-top: 6px;
+}
+
+/* Phones: offset drop shadows make everything look shifted right, so use a
+   plain double border instead and keep both sides equal. */
+@media (max-width: 600px) {
+  .win {
+    box-shadow: none;
+    outline: var(--px) solid var(--ink);
+    outline-offset: 3px;
+  }
+  .desk {
+    padding: 18px 13px calc(var(--safe-bottom) + 24px);
+  }
+  .home,
+  .side {
+    gap: 22px;
+  }
+  .big-btn {
+    box-shadow: none;
+    outline: var(--px) solid var(--ink);
+    outline-offset: 2px;
+  }
+  .win-sheet {
+    left: 8px;
+    right: 8px;
+    outline: none;
+  }
 }

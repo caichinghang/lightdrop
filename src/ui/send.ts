@@ -121,16 +121,15 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
   };
 
   const fsBtn = h("button", { class: "btn" }, "FULLSCREEN");
-  fsBtn.onclick = () => {
-    const p = document.fullscreenElement ? document.exitFullscreen() : stage.requestFullscreen?.();
-    void p?.catch(() => {});
-  };
+  fsBtn.onclick = () => toggleFullscreen();
   const stopBtn = h("button", { class: "btn" }, "STOP");
   stopBtn.onclick = onBack;
 
+  const menu = h("div", { class: "modal", hidden: true });
+  const closeMenu = () => (menu.hidden = true);
   const panel = win(
     "TRANSMITTING",
-    { onClose: onBack, cls: "win-panel" },
+    { onClose: closeMenu, cls: "win-panel" },
     h(
       "div",
       { class: "file-row" },
@@ -160,7 +159,30 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
     ),
     h("div", { class: "row-btns" }, fsBtn, stopBtn),
   );
-  const el = h("div", { class: "send-layout" }, stage, panel);
+  menu.append(panel);
+  menu.onclick = (e) => e.target === menu && closeMenu();
+
+  // The pattern gets the whole window; everything else lives in a slim strip
+  // and the MENU window. Bigger pattern = bigger modules = easier to read.
+  const stripBar = h("pre", { class: "strip-bar" }, asciiBar(0, 10));
+  const stripText = h("span", { class: "strip-text" }, "STREAMING");
+  const fsMini = h("button", { class: "btn small" }, "[ ]");
+  fsMini.title = "Fullscreen";
+  fsMini.onclick = () => toggleFullscreen();
+  const menuBtn = h("button", { class: "btn small" }, "MENU");
+  menuBtn.onclick = () => (menu.hidden = false);
+  const stopMini = h("button", { class: "btn small" }, "STOP");
+  stopMini.onclick = onBack;
+  const strip = h("div", { class: "strip" }, stripBar, stripText, h("span", { class: "spacer" }), fsMini, menuBtn, stopMini);
+  const el = h("div", { class: "send-layout" }, stage, strip, menu);
+
+  function toggleFullscreen() {
+    const p = document.fullscreenElement ? document.exitFullscreen() : el.requestFullscreen?.();
+    void p?.catch(() => {});
+  }
+  // Try fullscreen straight away (works when the file pick still counts as a
+  // user gesture; harmless when it doesn't).
+  void el.requestFullscreen?.().catch(() => {});
 
   // ---- grid geometry ----
   let grid = { W: 0, H: 0 };
@@ -297,7 +319,9 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
     wifiOverlay.hidden = true;
     doneOverlay.hidden = false;
     bar.textContent = asciiBar(1, 18);
+    stripBar.textContent = asciiBar(1, 10);
     stat.textContent = `Delivered ${formatBytes(file.size)}.`;
+    stripText.textContent = "DELIVERED";
     wantAwake(false);
   }
 
@@ -382,6 +406,11 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
     rate.push(confirmed);
     const pct = confirmed / Math.max(1, file.size);
     bar.textContent = asciiBar(pct, 18);
+    stripBar.textContent = asciiBar(pct, 10);
+    const sound = heard ? (now - sched.lastAckAt < 12000 ? "SOUND OK" : "SOUND LOST") : "NO SOUND";
+    stripText.textContent = wifiOpen
+      ? `${formatBytes(rate.rate)}/s · WI-FI`
+      : `${heard ? `${formatBytes(rate.rate)}/s · ` : ""}${level.label} · ${sound}`;
     if (wifiOpen) {
       stat.textContent = `${formatBytes(rate.rate)}/s over Wi-Fi · ${formatDuration((file.size - confirmed) / rate.rate)} left`;
     } else if (heard) {

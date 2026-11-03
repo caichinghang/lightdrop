@@ -26,6 +26,13 @@ export interface Detection {
   quad: Pt[];
   pitch: number;
   blocks: (Uint8Array | null)[];
+  /** Where the finders were (image order), for tracking in the next frame. */
+  track: Track;
+}
+
+export interface Track {
+  quad: Pt[];
+  size: number;
 }
 
 export interface Hint {
@@ -84,7 +91,7 @@ function downscale(g: Gray, f: number): Gray {
   return { data: out, w, h };
 }
 
-function binarize(g: Gray): Uint8Array {
+function binarize(g: Gray, radius?: number): Uint8Array {
   const { w, h, data } = g;
   const W1 = w + 1;
   const integral = new Float64Array(W1 * (h + 1));
@@ -95,7 +102,7 @@ function binarize(g: Gray): Uint8Array {
       integral[(y + 1) * W1 + x + 1] = integral[y * W1 + x + 1]! + row;
     }
   }
-  const r = Math.max(8, Math.round(Math.max(w, h) / 16));
+  const r = radius ?? Math.max(8, Math.round(Math.max(w, h) / 16));
   const bin = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
     const y0 = Math.max(0, y - r);
@@ -161,10 +168,10 @@ function crossCheck(bin: Uint8Array, w: number, h: number, cx: number, cy: numbe
   return { c: start + runs[2]! / 2 - 0.5, total: t };
 }
 
-export function findFinders(g: Gray): { cands: Candidate[]; scale: number } {
+export function findFinders(g: Gray, binRadius?: number): { cands: Candidate[]; scale: number } {
   const f = Math.max(g.w, g.h) > 1100 ? 2 : 1;
   const ds = downscale(g, f);
-  const bin = binarize(ds);
+  const bin = binarize(ds, binRadius);
   const { w, h } = ds;
   const cands: Candidate[] = [];
   const add = (x: number, y: number, size: number) => {
@@ -211,6 +218,37 @@ export function findFinders(g: Gray): { cands: Candidate[]; scale: number } {
     }
   }
   return { cands: cands.map((c) => ({ x: (c.x + 0.5) * f - 0.5, y: (c.y + 0.5) * f - 0.5, size: c.size * f, count: c.count })), scale: f };
+}
+
+function crop(g: Gray, x0: number, y0: number, w: number, h: number): Gray {
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) out.set(g.data.subarray((y0 + y) * g.w + x0, (y0 + y) * g.w + x0 + w), y * w);
+  return { data: out, w, h };
+}
+
+/**
+ * Re-find the four finders near where they were last frame: four small
+ * searches instead of a whole-image scan.
+ */
+function trackFinders(g: Gray, t: Track): Candidate[] | null {
+  const out: Candidate[] = [];
+  for (const [x, y] of t.quad) {
+    const r = Math.round(Math.max(t.size * 1.5, 40));
+    const x0 = Math.max(0, Math.round(x - r));
+    const y0 = Math.max(0, Math.round(y - r));
+    const x1 = Math.min(g.w, Math.round(x + r));
+    const y1 = Math.min(g.h, Math.round(y + r));
+    if (x1 - x0 < 16 || y1 - y0 < 16) return null;
+    const { cands } = findFinders(crop(g, x0, y0, x1 - x0, y1 - y0), Math.round(t.size * 0.9));
+    let best: Candidate | undefined;
+    for (const c of cands) {
+      if (c.size < t.size * 0.6 || c.size > t.size * 1.6) continue;
+      if (!best || c.count > best.count) best = c;
+    }
+    if (!best) return null;
+    out.push({ ...best, x: best.x + x0, y: best.y + y0 });
+  }
+  return out;
 }
 
 /** Sub-pixel finder centre: centroid of the dark centre square on the full-resolution image. */
@@ -585,9 +623,13 @@ function dimCandidates(est: number): number[] {
   return out;
 }
 
-export function detect(g: Gray, hint?: Hint): Detection | null {
-  const { cands } = findFinders(g);
-  const q = pickQuad(cands);
+export function detect(g: Gray, hint?: Hint, track?: Track): Detection | null {
+  let q: Candidate[] | null = null;
+  if (track) {
+    const t = trackFinders(g, track);
+    if (t) q = orderClockwise(t);
+  }
+  if (!q) q = pickQuad(findFinders(g).cands);
   if (!q) return null;
   const quad = q.map((c) => refineCentre(g, c));
   const pitch = q.reduce((s, c) => s + c.size, 0) / 4 / 15;
@@ -647,5 +689,5 @@ export function detect(g: Gray, hint?: Hint): Detection | null {
   const bits = readBits(g, l, mesh);
   const blocks: (Uint8Array | null)[] = [];
   for (let b = 0; b < l.blocks; b++) blocks.push(decodeBlock(bits, b));
-  return { W: pick.W, H: pick.H, rot: pick.rot, quad: corners, pitch, blocks };
+  return { W: pick.W, H: pick.H, rot: pick.rot, quad: corners, pitch, blocks, track: { quad, size: pitch * 15 } };
 }

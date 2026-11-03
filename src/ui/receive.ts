@@ -49,11 +49,14 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
   video.muted = true;
   const overlay = h("canvas", { class: "camera-overlay" }) as HTMLCanvasElement;
   const octx = overlay.getContext("2d")!;
-  const reticle = h("div", { class: "reticle" }, h("i"), h("i"), h("i"), h("i"));
-  const hintEl = h("div", { class: "aim-hint" }, "POINT THE CAMERA AT THE PATTERN ON THE OTHER SCREEN");
+  // The camera is shown as our own 1-bit dithered rendering, not the colour
+  // video (CSS filters on <video> aren't honoured everywhere). The whole frame
+  // is decoded, so there is no aiming box: the pattern can be anywhere.
+  const preview = h("canvas", { class: "camera-preview" }) as HTMLCanvasElement;
+  const hintEl = h("div", { class: "aim-hint" }, "POINT THE CAMERA AT THE PATTERN. ANYWHERE IN VIEW WORKS.");
   const closeBtn = h("button", { class: "btn cam-close" }, "< BACK");
   closeBtn.onclick = onBack;
-  const cam = h("div", { class: "camera-wrap" }, video, overlay, reticle, hintEl, closeBtn);
+  const cam = h("div", { class: "camera-wrap" }, video, preview, overlay, closeBtn, hintEl);
 
   const nameEl = h("strong", { class: "ellipsis" }, "SEARCHING...");
   const subEl = h("span", {}, "");
@@ -61,6 +64,9 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
   const lLight = statusLine("LIGHT");
   const lSound = statusLine("SOUND");
   const lWifi = statusLine("WI-FI");
+  lLight.el.classList.add("compact");
+  lSound.el.classList.add("compact");
+  lWifi.el.classList.add("compact");
   lLight.set("wait", "searching");
   lSound.set("wait", "ready");
   const diag = h("div", { class: "diag" }, "starting camera...");
@@ -97,7 +103,7 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     { cls: "win-sheet" },
     h("div", { class: "file-row" }, sprite("file", 3), h("div", { class: "file-meta" }, nameEl, subEl)),
     bar,
-    h("div", { class: "lines" }, lLight.el, lSound.el, lWifi.el),
+    h("div", { class: "lines row" }, lLight.el, lSound.el, lWifi.el),
     diag,
     h("div", { class: "row-links" }, soundBtn, wifiBtn),
   );
@@ -221,6 +227,57 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
       await track!.applyConstraints({ advanced: [{ focusMode: "continuous" } as MediaTrackConstraintSet] }).catch(() => {});
     }
     grabLoop();
+    previewLoop();
+  }
+
+  // ---- 1-bit preview ----
+  const pctx = preview.getContext("2d", { willReadFrequently: true })!;
+  const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16);
+  function previewLoop() {
+    let last = 0;
+    const draw = (now: number) => {
+      if (disposed || rx.completed) return;
+      requestAnimationFrame(draw);
+      if (now - last < 66 || video.readyState < 2) return; // ~15 fps is plenty for aiming
+      last = now;
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      const cw = cam.clientWidth;
+      const ch = cam.clientHeight;
+      if (!vw || !cw) return;
+      // Chunky pixels: one preview pixel per 2 CSS pixels.
+      const pw = Math.max(1, Math.round(cw / 2));
+      const ph = Math.max(1, Math.round(ch / 2));
+      if (preview.width !== pw || preview.height !== ph) {
+        preview.width = pw;
+        preview.height = ph;
+      }
+      // object-fit: cover, the same mapping the quad overlay uses
+      const s = Math.max(cw / vw, ch / vh);
+      const sw = cw / s;
+      const sh = ch / s;
+      pctx.drawImage(video, (vw - sw) / 2, (vh - sh) / 2, sw, sh, 0, 0, pw, ph);
+      const img = pctx.getImageData(0, 0, pw, ph);
+      const d = img.data;
+      let lo = 255;
+      let hi = 0;
+      for (let i = 0; i < d.length; i += 16) {
+        const g = (d[i]! + 2 * d[i + 1]! + d[i + 2]!) >> 2;
+        if (g < lo) lo = g;
+        if (g > hi) hi = g;
+      }
+      const span = Math.max(24, hi - lo);
+      for (let y = 0, i = 0; y < ph; y++) {
+        for (let x = 0; x < pw; x++, i += 4) {
+          const g = ((d[i]! + 2 * d[i + 1]! + d[i + 2]!) >> 2) - lo;
+          const v = g / span > BAYER[((y & 3) << 2) | (x & 3)]! ? 255 : 0;
+          d[i] = d[i + 1] = d[i + 2] = v;
+          d[i + 3] = 255;
+        }
+      }
+      pctx.putImageData(img, 0, 0);
+    };
+    requestAnimationFrame(draw);
   }
 
   // Frames go to the workers as ImageBitmaps when the browser can make them
@@ -293,7 +350,7 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
   }
 
   function drawQuad(r: DecodeRes) {
-    const rect = video.getBoundingClientRect();
+    const rect = cam.getBoundingClientRect();
     if (overlay.width !== Math.round(rect.width) || overlay.height !== Math.round(rect.height)) {
       overlay.width = Math.round(rect.width);
       overlay.height = Math.round(rect.height);
@@ -303,12 +360,17 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     const s = Math.max(rect.width / r.w, rect.height / r.h); // object-fit: cover
     const dx = (rect.width - r.w * s) / 2;
     const dy = (rect.height - r.h * s) / 2;
-    octx.setLineDash([6, 6]);
-    octx.lineWidth = 3;
-    octx.strokeStyle = r.blocks.length ? "#fff" : "#000";
+    // Marching-ants outline: black under white dashes, visible on any dither.
     octx.beginPath();
     r.quad.forEach(([x, y], i) => (i ? octx.lineTo(x * s + dx, y * s + dy) : octx.moveTo(x * s + dx, y * s + dy)));
     octx.closePath();
+    octx.setLineDash([]);
+    octx.lineWidth = 6;
+    octx.strokeStyle = "#000";
+    octx.stroke();
+    octx.setLineDash(r.blocks.length ? [10, 6] : [3, 9]);
+    octx.lineWidth = 3;
+    octx.strokeStyle = "#fff";
     octx.stroke();
   }
 
@@ -351,13 +413,11 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     const left = (rx.info.totalSize - doneBytes) / r;
     subEl.textContent = `${formatBytes(doneBytes)} / ${formatBytes(rx.info.totalSize)}${r > 0 ? ` · ${formatBytes(r)}/s · ${formatDuration(left)} left` : ""}`;
     const seeing = performance.now() - lastDecodeAt < 1000;
-    reticle.classList.toggle("locked", seeing);
     if (!wifiOpen) lLight.set(seeing ? "on" : "wait", seeing ? "reading" : "searching");
     else lLight.set("off", "paused");
   }, 250);
 
   async function showResult(info: TransferInfo) {
-    reticle.classList.add("locked");
     bar.textContent = asciiBar(1, 18);
     stream?.getTracks().forEach((t) => t.stop());
     wantAwake(false);
