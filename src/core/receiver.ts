@@ -61,6 +61,15 @@ export class Receiver {
     return this.info ? this.bytesDone / Math.max(1, this.info.totalSize) : 0;
   }
 
+  /** Like `progress`, but also credits segments that are partly decoded, so
+   *  the number moves frame by frame instead of every 256 KiB. */
+  get smoothProgress(): number {
+    if (!this.info) return 0;
+    let partial = 0;
+    for (const d of this.decoders.values()) partial += (d.rank / d.k) * d.segLen;
+    return Math.min(1, (this.bytesDone + partial) / Math.max(1, this.info.totalSize));
+  }
+
   private lock(fileId: number, totalSize: number) {
     this.info = { fileId, totalSize, name: "", mime: "" };
     this.haveMeta = false;

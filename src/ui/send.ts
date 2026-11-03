@@ -7,7 +7,7 @@ import { MsgType, parseAck, parseHeader, Reassembler } from "../audio/messages";
 import { SenderLink, decodeAnswer } from "../net/rtc";
 import { WireSender } from "../net/wire";
 import { WorkerPool } from "../workers/pool";
-import { RateMeter, chip, formatBytes, formatDuration, h, icons, isTouch, svg, wantAwake } from "./util";
+import { RateMeter, chip, formatBytes, formatDuration, h, icons, isTouch, svg, wantAwake, wifiEnabled, wifiToggle } from "./util";
 
 const QUIET = 3;
 
@@ -74,7 +74,8 @@ export function backButton(onBack: () => void): HTMLElement {
 /** The streaming screen. Returns the view and a cleanup function. */
 export function sendView(file: File, onBack: () => void): { el: HTMLElement; dispose: () => void } {
   const fileId = fileIdFor(file);
-  let levelIdx = isTouch() ? 3 : 4;
+  // Start conservative; with sound ACKs, Auto climbs within seconds.
+  let levelIdx = isTouch() ? 2 : 3;
   let auto = true;
   let level = LADDER[levelIdx]!;
   let frameLen = frameLenFor(level.version);
@@ -135,6 +136,7 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
     h("summary", {}, svg(icons.gear), "Stream density"),
     h("label", {}, levelSel),
     h("p", { class: "muted small" }, "Auto speeds up while the receiver keeps up (it reports back by sound), and slows down when it struggles."),
+    wifiToggle((on) => (on ? startLink() : stopLink())),
   );
 
   const fsBtn = h("button", { class: "icon-btn", "aria-label": "Fullscreen" }, svg(icons.expand));
@@ -176,44 +178,60 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
     levelLabel.textContent = `${auto ? "Auto · " : ""}${level.label} — ${level.codes}× QR v${level.version} at ${level.fps} fps`;
   }
 
-  // ---- signalling: offer frames + sound back-channel ----
-  const link = new SenderLink();
+  // ---- signalling: offer frames (optional Wi-Fi upgrade) + sound back-channel ----
+  let link: SenderLink | undefined;
   let signalFrames: { chunks: Uint8Array[] } | undefined;
-  link
-    .offer()
-    .then((deflated) => {
-      const cap = signalChunkCapacity(frameLenFor(15));
-      const chunks: Uint8Array[] = [];
-      for (let o = 0; o < deflated.length; o += cap) chunks.push(deflated.subarray(o, o + cap));
-      signalFrames = { chunks };
-    })
-    .catch(() => cWifi.set("off", "Wi-Fi unavailable"));
-  link.dc.onopen = () => {
-    wifiOpen = true;
-    cWifi.set("on", "Wi-Fi connected");
-    cLight.set("off", "Paused");
-    wifiOverlay.hidden = false;
-    wire = new WireSender(link.dc, sched, { t: "meta", fileId, size: file.size, name: file.name, mime: file.type }, () => {});
-  };
-  link.dc.onclose = () => {
-    wifiOpen = false;
-    cWifi.set("off", "Wi-Fi lost");
-    cLight.set("on", "Streaming");
-    wifiOverlay.hidden = true;
-  };
-  link.dc.addEventListener("message", (e) => {
-    if (typeof e.data !== "string") return;
-    const m = JSON.parse(e.data);
-    if (m.t === "progress") {
-      wifiBytes = m.bytes;
-      if (m.ack) sched.onAck(m.ack);
-      if (m.complete) finish();
-    }
-  });
-  link.pc.onconnectionstatechange = () => {
-    if (link.pc.connectionState === "connecting") cWifi.set("wait", "Connecting…");
-    if (link.pc.connectionState === "failed") cWifi.set("off", "Not on same Wi-Fi");
-  };
+
+  function startLink() {
+    if (link) return;
+    const l = (link = new SenderLink());
+    cWifi.set("wait", "Offering…");
+    l.offer()
+      .then((deflated) => {
+        if (link !== l) return;
+        const cap = signalChunkCapacity(frameLenFor(15));
+        const chunks: Uint8Array[] = [];
+        for (let o = 0; o < deflated.length; o += cap) chunks.push(deflated.subarray(o, o + cap));
+        signalFrames = { chunks };
+      })
+      .catch(() => cWifi.set("off", "Wi-Fi unavailable"));
+    l.dc.onopen = () => {
+      wifiOpen = true;
+      cWifi.set("on", "Wi-Fi connected");
+      cLight.set("off", "Paused");
+      wifiOverlay.hidden = false;
+      wire = new WireSender(l.dc, sched, { t: "meta", fileId, size: file.size, name: file.name, mime: file.type }, () => {});
+    };
+    l.dc.onclose = () => {
+      wifiOpen = false;
+      if (link === l) cWifi.set("off", "Wi-Fi lost");
+      cLight.set("on", "Streaming");
+      wifiOverlay.hidden = true;
+    };
+    l.dc.addEventListener("message", (e) => {
+      if (typeof e.data !== "string") return;
+      const m = JSON.parse(e.data);
+      if (m.t === "progress") {
+        wifiBytes = m.bytes;
+        if (m.ack) sched.onAck(m.ack);
+        if (m.complete) finish();
+      }
+    });
+    l.pc.onconnectionstatechange = () => {
+      if (l.pc.connectionState === "connecting") cWifi.set("wait", "Connecting…");
+      if (l.pc.connectionState === "failed") cWifi.set("off", "Not on same network");
+    };
+  }
+
+  function stopLink() {
+    signalFrames = undefined;
+    link?.close();
+    link = undefined;
+    cWifi.set("off", "Wi-Fi off");
+  }
+
+  if (wifiEnabled()) startLink();
+  else cWifi.set("off", "Wi-Fi off");
 
   const reasm = new Reassembler();
   const listener = new SoundListener((pkt) => {
@@ -230,6 +248,7 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
     if (msg?.type === MsgType.Answer) {
       const ans = decodeAnswer(msg.bytes);
       if (ans) {
+        if (!link) return;
         cWifi.set("wait", "Connecting…");
         link.accept(ans).catch(() => cWifi.set("off", "Wi-Fi failed"));
       }
@@ -272,7 +291,7 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
         out.push(encodeMeta(frameLen, fileId, file.size, file.name, file.type));
         continue;
       }
-      if (signalFrames && !wifiOpen && frameCounter % 9 === 0) {
+      if (signalFrames && link && !wifiOpen && frameCounter % 9 === 0) {
         const parts = signalFrames.chunks;
         const part = Math.floor(frameCounter / 9) % parts.length;
         out.push(encodeSignal(frameLen, fileId, link.offerId, part, parts.length, parts[part]!));
@@ -391,7 +410,7 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
       disposed = true;
       encoders.terminate();
       listener.stop();
-      link.close();
+      link?.close();
       wantAwake(false);
     },
   };

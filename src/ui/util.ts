@@ -104,3 +104,35 @@ export function chip(icon: string, label: string): { el: HTMLElement; set(state:
     },
   };
 }
+
+const WIFI_KEY = "lightdrop.wifi";
+
+/** Whether to try the Wi-Fi upgrade. Off is better on school/office networks,
+ *  which usually block device-to-device traffic. Remembered per device. */
+export function wifiEnabled(): boolean {
+  try {
+    return localStorage.getItem(WIFI_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+export function setWifiEnabled(on: boolean) {
+  try {
+    localStorage.setItem(WIFI_KEY, on ? "1" : "0");
+  } catch {}
+}
+
+export function wifiToggle(onChange: (on: boolean) => void): HTMLElement {
+  const box = h("input", { type: "checkbox", checked: wifiEnabled() }) as HTMLInputElement;
+  box.onchange = () => {
+    setWifiEnabled(box.checked);
+    onChange(box.checked);
+  };
+  return h(
+    "label",
+    { class: "toggle" },
+    box,
+    h("span", {}, h("b", {}, "Use Wi-Fi when possible"), h("br"), h("span", { class: "muted small" }, "Turn off on school or office Wi-Fi — they block devices from talking to each other.")),
+  );
+}

@@ -11,16 +11,29 @@ const ready = prepareZXingModule({
 let canvas: OffscreenCanvas | undefined;
 
 self.onmessage = async (e: MessageEvent) => {
-  const { id, bitmap, maxSymbols } = e.data as { id: number; bitmap: ImageBitmap; maxSymbols: number };
+  const { id, bitmap, buf, w, h, maxSymbols } = e.data as {
+    id: number;
+    bitmap?: ImageBitmap;
+    /** Fallback when the main thread can't make ImageBitmaps from video: raw RGBA. */
+    buf?: ArrayBuffer;
+    w?: number;
+    h?: number;
+    maxSymbols: number;
+  };
   try {
     await ready;
-    if (!canvas || canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
-      canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    let img: ImageData;
+    if (bitmap) {
+      if (!canvas || canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+        canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      }
+      const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+      ctx.drawImage(bitmap, 0, 0);
+      bitmap.close();
+      img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    } else {
+      img = new ImageData(new Uint8ClampedArray(buf!), w!, h!);
     }
-    const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
-    ctx.drawImage(bitmap, 0, 0);
-    bitmap.close();
-    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const results = await readBarcodes(img, {
       formats: ["QRCode"],
       tryHarder: false,

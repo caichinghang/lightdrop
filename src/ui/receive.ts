@@ -6,7 +6,7 @@ import { WireReceiver } from "../net/wire";
 import { FileSink } from "../storage/store";
 import { WorkerPool } from "../workers/pool";
 import { backButton } from "./send";
-import { RateMeter, chip, formatBytes, formatDuration, h, icons, svg, wantAwake } from "./util";
+import { RateMeter, chip, formatBytes, formatDuration, h, icons, isTouch, setWifiEnabled, svg, wantAwake, wifiEnabled } from "./util";
 
 interface DecodeRes {
   id: number;
@@ -18,6 +18,12 @@ interface DecodeRes {
 }
 
 const ACK_EVERY_MS = 2500;
+/** Give up offering Wi-Fi after this long (networks that block peers never connect). */
+const WIFI_GIVE_UP_MS = 30000;
+/** Decode attempts per second: full speed while codes are in view, slow while searching.
+ *  This, plus fewer workers on phones, is what keeps the phone from heating up. */
+const SCAN_FPS_LOCKED = 20;
+const SCAN_FPS_SEARCHING = 6;
 
 export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () => void } {
   // Called from the tap that opened this view: unlocks audio on iOS.
@@ -27,6 +33,8 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
   let wire: WireReceiver | undefined;
   let rtc: ReceiverLink | undefined;
   let answerPackets: Uint8Array[] | undefined;
+  let answerSince = 0;
+  let useWifi = wifiEnabled();
   let wifiOpen = false;
   let lastDecodeAt = 0;
   const talker = new SoundTalker();
@@ -56,12 +64,32 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     soundToggle.textContent = soundOn ? "Mute sound link" : "Unmute sound link";
     cSound.set(soundOn ? "wait" : "off", soundOn ? "Talking" : "Muted");
   };
+  const wifiBtn = h("button", { class: "link-btn" });
+  const syncWifiBtn = () => {
+    wifiBtn.textContent = useWifi ? "Turn off Wi-Fi" : "Turn on Wi-Fi";
+    if (!useWifi) cWifi.set("off", "Wi-Fi off");
+  };
+  wifiBtn.onclick = () => {
+    useWifi = !useWifi;
+    setWifiEnabled(useWifi);
+    if (!useWifi) {
+      answerPackets = undefined;
+      if (!wifiOpen) {
+        rtc?.close();
+        rtc = undefined;
+      }
+    }
+    syncWifiBtn();
+  };
+  syncWifiBtn();
+  const diag = h("div", { class: "diag" }, "Starting camera…");
   const sheet = h(
     "aside",
     { class: "sheet" },
     h("div", { class: "sheet-main" }, ring, h("div", { class: "file-meta" }, nameEl, subEl)),
     h("div", { class: "chips" }, cLight.el, cSound.el, cWifi.el),
-    soundToggle,
+    diag,
+    h("div", { class: "links" }, soundToggle, wifiBtn),
   );
   const result = h("div", { class: "result", hidden: true });
   const el = h("div", { class: "page receive" }, h("header", { class: "bar overlay" }, backButton(onBack)), cam, sheet, result);
@@ -78,7 +106,7 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
       nameEl.textContent = info.name;
     },
     onOffer(offerId, deflated) {
-      if (rtc) return;
+      if (rtc || !useWifi) return;
       rtc = new ReceiverLink();
       rtc.onChannel = (dc) => {
         dc.onopen = () => onWifi(dc);
@@ -95,7 +123,9 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
       rtc
         .answer(offerId, deflated)
         .then((bytes) => {
+          if (!useWifi) return;
           answerPackets = fragmentPackets(MsgType.Answer, offerId & 0xff, bytes);
+          answerSince = performance.now();
           cWifi.set("wait", "Offering…");
         })
         .catch(() => cWifi.set("off", "Wi-Fi unavailable"));
@@ -133,6 +163,11 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
       if (soundOn && !wifiOpen && rx.info && ack && (!rx.completed || finalAcks < 3)) {
         if (rx.completed) finalAcks++;
         const packets = [ackPacket(rx.info.fileId, ack)];
+        if (answerPackets && performance.now() - answerSince > WIFI_GIVE_UP_MS) {
+          // Never connected: this network keeps devices apart. Stop spending sound on it.
+          answerPackets = undefined;
+          cWifi.set("off", "Not on same network");
+        }
         if (answerPackets) packets.push(...answerPackets);
         cSound.set("on", "Talking");
         await talker.say(packets);
@@ -144,8 +179,12 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
   // ---- camera ----
   const decoders = new WorkerPool<object, DecodeRes>(
     () => new Worker(new URL("../workers/qr-decode.worker.ts", import.meta.url), { type: "module" }),
-    Math.max(2, Math.min(4, (navigator.hardwareConcurrency || 4) - 1)),
+    isTouch() ? 2 : 3,
   );
+  let camInfo = "";
+  let scans = 0;
+  let codesSeen = 0;
+  let grabError = "";
 
   async function startCamera() {
     try {
@@ -162,6 +201,8 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     video.srcObject = stream;
     await video.play().catch(() => {});
     const track = stream.getVideoTracks()[0];
+    const st = track?.getSettings();
+    camInfo = st ? `${st.width}×${st.height}@${Math.round(st.frameRate ?? 0)}` : "";
     // Continuous focus where the platform lets us ask for it.
     const caps = (track?.getCapabilities?.() ?? {}) as MediaTrackCapabilities & { focusMode?: string[] };
     if (caps.focusMode?.includes("continuous")) {
@@ -170,17 +211,55 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     grabLoop();
   }
 
+  // Frames go to the decode workers as ImageBitmaps when the browser can make
+  // them from a <video>; otherwise as raw RGBA read back through a canvas.
+  let bitmapOk = typeof createImageBitmap === "function";
+  const grabCanvas = document.createElement("canvas");
+  const grabCtx = grabCanvas.getContext("2d", { willReadFrequently: true })!;
+
+  async function grabFrame(): Promise<{ msg: object; transfer: Transferable[] } | null> {
+    if (bitmapOk) {
+      try {
+        const bitmap = await createImageBitmap(video);
+        return { msg: { bitmap }, transfer: [bitmap] };
+      } catch {
+        bitmapOk = false;
+      }
+    }
+    const w = video.videoWidth;
+    const hgt = video.videoHeight;
+    if (!w || !hgt) return null;
+    if (grabCanvas.width !== w || grabCanvas.height !== hgt) {
+      grabCanvas.width = w;
+      grabCanvas.height = hgt;
+    }
+    grabCtx.drawImage(video, 0, 0);
+    const buf = grabCtx.getImageData(0, 0, w, hgt).data.buffer;
+    return { msg: { buf, w, h: hgt }, transfer: [buf] };
+  }
+
   function grabLoop() {
+    let lastGrab = 0;
+    let grabbing = false;
     const onFrame = () => {
       if (disposed) return;
       schedule();
-      if (rx.completed || video.readyState < 2 || decoders.idle === 0) return;
-      const p = createImageBitmap(video);
-      void p.then((bitmap) => {
-        const job = decoders.tryRun({ bitmap, maxSymbols: 6 }, [bitmap]);
-        if (!job) return bitmap.close();
-        void job.then(onDecoded);
-      });
+      if (rx.completed || video.readyState < 2 || grabbing || decoders.idle === 0) return;
+      const now = performance.now();
+      const locked = now - lastDecodeAt < 1500;
+      if (now - lastGrab < 1000 / (locked ? SCAN_FPS_LOCKED : SCAN_FPS_SEARCHING)) return;
+      lastGrab = now;
+      grabbing = true;
+      grabFrame()
+        .then((f) => {
+          if (!f) return;
+          const job = decoders.tryRun({ ...f.msg, maxSymbols: 6 }, f.transfer);
+          if (!job) return (f.msg as { bitmap?: ImageBitmap }).bitmap?.close();
+          scans++;
+          void job.then(onDecoded);
+        })
+        .catch((e) => (grabError = String(e)))
+        .finally(() => (grabbing = false));
     };
     const schedule = () => {
       if ("requestVideoFrameCallback" in video) video.requestVideoFrameCallback(onFrame);
@@ -191,6 +270,8 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
 
   function onDecoded(r: DecodeRes) {
     if (disposed) return;
+    if (r.error) grabError = r.error;
+    codesSeen += r.codes.length;
     for (const c of r.codes) rx.onFrame(c);
     if (r.codes.length) lastDecodeAt = performance.now();
     drawBoxes(r);
@@ -219,15 +300,42 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
   }
 
   // ---- stats ----
+  const pct0 = () => rx.smoothProgress;
+  let lastDiagAt = performance.now();
+  let lastScans = 0;
+  let lastCodes = 0;
   const statsTimer = setInterval(() => {
+    const t = performance.now();
+    if (t - lastDiagAt >= 1000) {
+      const dt = (t - lastDiagAt) / 1000;
+      const scanRate = (scans - lastScans) / dt;
+      const codeRate = (codesSeen - lastCodes) / dt;
+      lastDiagAt = t;
+      lastScans = scans;
+      lastCodes = codesSeen;
+      diag.textContent = [
+        camInfo && `camera ${camInfo}`,
+        `${scanRate.toFixed(0)} scans/s`,
+        `${codeRate.toFixed(0)} codes/s`,
+        rx.totalFrames ? `${rx.usefulFrames} useful` : "",
+        bitmapOk ? "" : "readback",
+        grabError && `error: ${grabError.slice(0, 80)}`,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    }
+    if (!rx.info && scans > 60 && codesSeen === 0 && !hintEl.classList.contains("error")) {
+      hintEl.textContent = "No codes seen yet. Move closer so the codes fill the brackets, hold steady, or pick a lower Stream density on the sender.";
+    }
     if (!rx.info || rx.completed) return;
-    meter.push(rx.bytesDone);
-    const pct = rx.progress;
+    const doneBytes = pct0() * rx.info.totalSize;
+    meter.push(doneBytes);
+    const pct = pct0();
     pctEl.textContent = `${Math.floor(pct * 100)}%`;
     ring.style.setProperty("--p", String(pct));
     const r = meter.rate;
-    const left = (rx.info.totalSize - rx.bytesDone) / r;
-    subEl.textContent = `${formatBytes(rx.bytesDone)} of ${formatBytes(rx.info.totalSize)}${r > 0 ? ` · ${formatBytes(r)}/s · ${formatDuration(left)} left` : ""}`;
+    const left = (rx.info.totalSize - doneBytes) / r;
+    subEl.textContent = `${formatBytes(doneBytes)} of ${formatBytes(rx.info.totalSize)}${r > 0 ? ` · ${formatBytes(r)}/s · ${formatDuration(left)} left` : ""}`;
     const seeing = performance.now() - lastDecodeAt < 1000;
     reticle.classList.toggle("locked", seeing);
     if (!wifiOpen) cLight.set(seeing ? "on" : "wait", seeing ? "Reading" : "Searching");

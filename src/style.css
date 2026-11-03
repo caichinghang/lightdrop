@@ -648,3 +648,25 @@ canvas.qr {
   width: 100%;
   margin-top: 14px;
 }
+
+.diag {
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  min-height: 1.4em;
+}
+.sheet .links {
+  display: flex;
+  gap: 18px;
+}
+.toggle {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin-top: 12px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.toggle input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
