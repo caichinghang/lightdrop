@@ -1,0 +1,25 @@
+{
+  "name": "lightdrop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Send files screen-to-camera with a sound back-channel that auto-upgrades to a direct Wi-Fi link.",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host",
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/qrcode": "^1.5.6",
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^7.3.7"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "zxing-wasm": "^3.1.6"
+  }
+}
