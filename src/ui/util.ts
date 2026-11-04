@@ -99,31 +99,25 @@ export function statusLine(label: string): { el: HTMLElement; set(state: LineSta
   };
 }
 
-/** "[x] label" checkbox. */
-export function asciiCheck(label: string, checked: boolean, onChange: (on: boolean) => void, hint?: string): HTMLElement {
-  const box = h("input", { type: "checkbox", checked }) as HTMLInputElement;
-  const mark = h("span", { class: "ac-box", "aria-hidden": "true" }, checked ? "[x]" : "[ ]");
-  box.onchange = () => {
-    mark.textContent = box.checked ? "[x]" : "[ ]";
-    onChange(box.checked);
+/** "LABEL [-] value [+]" stepper over a list of options. */
+export function stepper(label: string, options: number[], index: number, fmt: (v: number) => string, onChange: (i: number) => void) {
+  let i = index;
+  const value = h("span", { class: "st-value" });
+  const minus = h("button", { class: "btn small st-btn", "aria-label": `${label} down` }, "-");
+  const plus = h("button", { class: "btn small st-btn", "aria-label": `${label} up` }, "+");
+  const render = () => {
+    value.textContent = fmt(options[i]!);
+    minus.disabled = i === 0;
+    plus.disabled = i === options.length - 1;
   };
-  return h("label", { class: "ac" }, box, mark, h("span", {}, label, hint ? h("small", {}, hint) : null));
-}
-
-const WIFI_KEY = "lightdrop.wifi";
-
-/** Whether to try the Wi-Fi upgrade. Off is better on school/office networks,
- *  which usually block device-to-device traffic. Remembered per device. */
-export function wifiEnabled(): boolean {
-  try {
-    return localStorage.getItem(WIFI_KEY) !== "0";
-  } catch {
-    return true;
-  }
-}
-
-export function setWifiEnabled(on: boolean) {
-  try {
-    localStorage.setItem(WIFI_KEY, on ? "1" : "0");
-  } catch {}
+  minus.onclick = () => {
+    if (i > 0) onChange(--i);
+    render();
+  };
+  plus.onclick = () => {
+    if (i < options.length - 1) onChange(++i);
+    render();
+  };
+  render();
+  return h("div", { class: "stepper" }, h("span", { class: "st-label" }, label), minus, value, plus);
 }

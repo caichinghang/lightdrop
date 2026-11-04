@@ -1,38 +1,19 @@
 // Dev harness: the sender screen's canvas is fed straight into the real
-// decode workers and Receiver, so everything except the camera and the speaker
+// decode workers and Receiver, so everything except the camera
 // is exercised. Also runs the WebRTC compressed-answer handshake in-page.
 import "../style.css";
 import { sendView } from "../ui/send";
 import { Receiver } from "../core/receiver";
 import { FileSink } from "../storage/store";
 import { WorkerPool } from "../workers/pool";
-import { ReceiverLink, SenderLink, decodeAnswer } from "../net/rtc";
 
 const log = (s: string) => {
   document.getElementById("log")!.textContent += s + "\n";
   console.log(s);
 };
-(window as any).loopback = { done: false, ok: false, rtc: "pending" };
+(window as any).loopback = { done: false, ok: false };
 // The preview pane may be hidden, which pauses rAF; timers keep the harness going.
 window.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 8) as unknown as number;
-
-async function rtcTest() {
-  try {
-    const s = new SenderLink();
-    const offer = await s.offer();
-    const r = new ReceiverLink();
-    const opened = new Promise<void>((res) => (r.onChannel = (dc) => (dc.onopen = () => res())));
-    const answer = await r.answer(s.offerId, offer);
-    log(`rtc: offer ${offer.length} B deflated, answer ${answer.length} B compact`);
-    await s.accept(decodeAnswer(answer)!);
-    await Promise.race([opened, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 8000))]);
-    (window as any).loopback.rtc = "open";
-    log("rtc: data channel OPEN from compact answer");
-  } catch (e) {
-    (window as any).loopback.rtc = String(e);
-    log("rtc: FAILED " + e);
-  }
-}
 
 async function main() {
   const size = Number(new URLSearchParams(location.search).get("size") ?? 1_500_000);
@@ -76,6 +57,5 @@ async function main() {
     }
   };
   grab();
-  void rtcTest();
 }
 void main();

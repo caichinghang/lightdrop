@@ -50,9 +50,9 @@ function home() {
     h(
       "ul",
       { class: "how" },
-      h("li", {}, sprite("sun", 3), h("span", {}, h("b", {}, "LIGHT"), " carries the file as a pattern of black and white blocks.")),
-      h("li", {}, sprite("speaker", 3), h("span", {}, h("b", {}, "SOUND"), " lets the receiver chirp back what it still needs.")),
-      h("li", {}, sprite("wifi", 3), h("span", {}, h("b", {}, "WI-FI"), " takes over by itself when both share a network.")),
+      h("li", {}, sprite("sun", 3), h("span", {}, h("b", {}, "LIGHT"), " carries the file as moving black and white squares.")),
+      h("li", {}, sprite("camera", 3), h("span", {}, h("b", {}, "ANY CAMERA"), " reads it: phone or laptop webcam. Missed frames don't matter.")),
+      h("li", {}, sprite("check", 3), h("span", {}, h("b", {}, "NOTHING TO CONNECT."), " No Wi-Fi, no Bluetooth, no internet. Works in airplane mode.")),
     ),
   );
   const saved = h("div", { class: "saved-slot" });
@@ -138,9 +138,6 @@ function route() {
 }
 
 window.addEventListener("hashchange", route);
-// Opening #receive cold (bookmark, reload) has no user gesture for audio;
-// route through home so the Receive tap unlocks it.
-if (location.hash === "#receive") history.replaceState(null, "", location.pathname);
 route();
 void opfs();
 

@@ -28,6 +28,8 @@ interface Cam {
   noise: number;
   /** optional second frame shown below this image row (rolling-shutter tear) */
   tearAt?: number;
+  /** screen black / white / surroundings brightness */
+  levels?: [number, number, number];
 }
 
 /** Photograph a module grid: perspective, lens barrel, blur, low contrast, noise. */
@@ -58,13 +60,14 @@ function photograph(grids: Uint8Array[], W: number, H: number, cam: Cam, seed = 
           const sa = Math.sin(-cam.angle);
           const u = (px * ca - py * sa) / cam.pitch + TW / 2;
           const v = (px * sa + py * ca) / cam.pitch + TH / 2;
-          let val = 90; // desk / bezel
+          const [lo, hi, bg] = cam.levels ?? [35, 205, 90];
+          let val = bg; // desk / bezel
           if (u >= 0 && v >= 0 && u < TW && v < TH) {
             const gx = Math.floor(u) - QUIET;
             const gy = Math.floor(v) - QUIET;
             const grid = cam.tearAt !== undefined && y >= cam.tearAt ? grids[1]! : grids[0]!;
             const dark = gx >= 0 && gy >= 0 && gx < W && gy < H && grid[gy * W + gx];
-            val = dark ? 35 : 205;
+            val = dark ? lo : hi;
           }
           acc += val;
         }
@@ -167,4 +170,28 @@ test("tall (portrait) grid filmed sideways", () => {
   console.log(`  portrait sideways: ${s.ok}/${s.total}, grid ${d!.W}x${d!.H}`);
   assert.equal(s.wrong, 0);
   assert.ok(s.ok >= s.total * 0.8);
+});
+
+test("laptop webcam reading a phone: small, dark room, over-exposed, blurry", () => {
+  for (const [W, H, pitch] of [
+    [64, 112, 3.4],
+    [80, 144, 3.0],
+    [96, 168, 2.6],
+  ] as const) {
+    const blocks = makeBlocks(W, H, 7);
+    const g = photograph([encodeFrame(W, H, blocks)], W, H, {
+      ...base,
+      angle: 0.08,
+      tilt: 0.05,
+      pitch,
+      blur: 2,
+      noise: 14,
+      levels: [95, 255, 25], // blacks lifted by glare, whites clipped, dark room
+    });
+    const d = detect(g);
+    const s = d ? score(blocks, d.blocks) : { ok: 0, wrong: 0, total: blocks.length };
+    console.log(`  webcam ${W}x${H} @ ${pitch}px: ${s.ok}/${s.total}`);
+    assert.equal(s.wrong, 0);
+    if (W === 64) assert.ok(s.ok >= s.total * 0.75, "coarsest grid must read");
+  }
 });

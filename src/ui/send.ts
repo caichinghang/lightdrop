@@ -1,27 +1,11 @@
 import { crc32 } from "../core/crc";
-import { LADDER, levelRate } from "../core/density";
-import { PAYLOAD_LEN, SIGNAL_CHUNK, encodeData, encodeMeta, encodeSignal, fileId24 } from "../core/frame";
+import { FPS, GRIDS, defaults, rawRate } from "../core/density";
+import { PAYLOAD_LEN, encodeData, encodeMeta, fileId24 } from "../core/frame";
 import { Scheduler } from "../core/scheduler";
-import { SoundListener } from "../audio/io";
-import { MsgType, parseAck, parseHeader, Reassembler } from "../audio/messages";
-import { SenderLink, decodeAnswer } from "../net/rtc";
-import { WireSender } from "../net/wire";
 import { encodeFrame } from "../optical/encode";
 import { QUIET, gridFor, layout } from "../optical/layout";
-import { asciiBar, sprite } from "./pixels";
-import {
-  RateMeter,
-  asciiCheck,
-  formatBytes,
-  formatDuration,
-  h,
-  isTouch,
-  setWifiEnabled,
-  statusLine,
-  wantAwake,
-  wifiEnabled,
-  win,
-} from "./util";
+import { sprite } from "./pixels";
+import { formatBytes, formatDuration, h, isTouch, stepper, wantAwake, win } from "./util";
 
 export function fileIdFor(f: File): number {
   return fileId24(crc32(new TextEncoder().encode(`${f.name}|${f.size}|${f.lastModified}`))) || 1;
@@ -51,7 +35,7 @@ export function pickFileView(onFile: (f: File) => void, onBack: () => void): HTM
         { class: "note" },
         "On the other device: open this page, press ",
         h("b", {}, "RECEIVE"),
-        " and point the camera at this screen. No pairing. No network.",
+        " and point the camera at this screen. Nothing to connect.",
       ),
     ),
   );
@@ -68,262 +52,97 @@ export function pickFileView(onFile: (f: File) => void, onBack: () => void): HTM
   return view;
 }
 
-/** The streaming screen. Returns the view and a cleanup function. */
+const GRID_KEY = "lightdrop.grid";
+const FPS_KEY = "lightdrop.fps";
+
+function remembered(key: string, fallback: number, max: number): number {
+  try {
+    const v = Number(localStorage.getItem(key));
+    return localStorage.getItem(key) !== null && Number.isInteger(v) && v >= 0 && v < max ? v : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function remember(key: string, v: number) {
+  try {
+    localStorage.setItem(key, String(v));
+  } catch {}
+}
+
+/**
+ * The streaming screen: the pattern fills the window, with one strip of
+ * controls. One-way: the sender loops the file (fountain-coded, so any
+ * blocks in any order will do) until you stop it.
+ */
 export function sendView(file: File, onBack: () => void): { el: HTMLElement; dispose: () => void } {
   const fileId = fileIdFor(file);
-  // Start middling; with sound ACKs, Auto climbs within seconds.
-  let levelIdx = isTouch() ? 3 : 4;
-  let auto = true;
-  let level = LADDER[levelIdx]!;
+  const phone = isTouch();
+  // Settings are remembered per device and direction (phone-as-sender vs
+  // computer-as-sender behave very differently).
+  const d = defaults(phone);
+  const sfx = phone ? ".phone" : ".desk";
+  let gridIdx = remembered(GRID_KEY + sfx, d.grid, GRIDS.length);
+  let fpsIdx = remembered(FPS_KEY + sfx, d.fps, FPS.length);
   const sched = new Scheduler(file, fileId, PAYLOAD_LEN);
   let disposed = false;
-  let lastLevelChange = performance.now();
-  let finished = false;
-  let wifiBytes = 0;
-  let wifiOpen = false;
-  let frameNo = 0;
-  const rate = new RateMeter(4000);
 
   // ---- view ----
   const canvas = h("canvas", { class: "code" }) as HTMLCanvasElement;
   const ctx = canvas.getContext("2d")!;
   const stage = h("div", { class: "stage" }, canvas);
-  const wifiOverlay = h(
-    "div",
-    { class: "stage-overlay", hidden: true },
-    sprite("wifi", 8),
-    h("strong", {}, "SENDING OVER WI-FI"),
-    h("span", {}, "You can put the devices down."),
-  );
-  const doneOverlay = h(
-    "div",
-    { class: "stage-overlay", hidden: true },
-    sprite("face", 8),
-    h("strong", {}, "DELIVERED"),
-    h("span", {}, `${file.name} arrived safely.`),
-  );
-  stage.append(wifiOverlay, doneOverlay);
 
-  const lLight = statusLine("LIGHT");
-  const lSound = statusLine("SOUND");
-  const lWifi = statusLine("WI-FI");
-  lLight.set("on", "streaming");
-  const bar = h("pre", { class: "bar" }, asciiBar(0, 18));
-  const stat = h("div", { class: "stat" }, "Waiting for a receiver...");
-  const levelLine = h("div", { class: "level" });
-
-  const levelSel = h("select", { class: "select" }) as HTMLSelectElement;
-  levelSel.append(h("option", { value: "auto" }, "AUTO"));
-  LADDER.forEach((l, i) => levelSel.append(h("option", { value: String(i) }, `${l.label}  ${l.cols} cols @ ${l.fps}fps`)));
-  levelSel.onchange = () => {
-    auto = levelSel.value === "auto";
-    setLevel(auto ? levelIdx : Number(levelSel.value));
-  };
-
-  const fsBtn = h("button", { class: "btn" }, "FULLSCREEN");
+  const info = h("span", { class: "strip-text" });
+  const gridStep = stepper("GRID", GRIDS, gridIdx, (v) => String(v), (i) => {
+    gridIdx = i;
+    remember(GRID_KEY + sfx, i);
+    recomputeGrid();
+  });
+  const fpsStep = stepper("FPS", FPS, fpsIdx, (v) => String(v), (i) => {
+    fpsIdx = i;
+    remember(FPS_KEY + sfx, i);
+    updateInfo();
+  });
+  const fsBtn = h("button", { class: "btn small" }, "FULL");
+  fsBtn.title = "Fullscreen";
   fsBtn.onclick = () => toggleFullscreen();
-  const stopBtn = h("button", { class: "btn" }, "STOP");
+  // iPhone Safari can't make a page element fullscreen.
+  if (!document.fullscreenEnabled) fsBtn.hidden = true;
+  const stopBtn = h("button", { class: "btn small" }, "STOP");
   stopBtn.onclick = onBack;
-
-  const menu = h("div", { class: "modal", hidden: true });
-  const closeMenu = () => (menu.hidden = true);
-  const panel = win(
-    "TRANSMITTING",
-    { onClose: closeMenu, cls: "win-panel" },
-    h(
-      "div",
-      { class: "file-row" },
-      sprite("file", 3),
-      h("div", { class: "file-meta" }, h("strong", { class: "ellipsis" }, file.name), h("span", {}, formatBytes(file.size))),
-    ),
-    bar,
-    stat,
-    h("div", { class: "lines" }, lLight.el, lSound.el, lWifi.el),
-    levelLine,
-    h(
-      "details",
-      { class: "settings" },
-      h("summary", {}, "SETTINGS"),
-      h("label", { class: "field" }, h("span", {}, "DENSITY"), levelSel),
-      h("p", { class: "small" }, "AUTO keeps raising density while the receiver keeps up (it reports back by sound), and backs off when speed drops."),
-      asciiCheck(
-        "USE WI-FI WHEN POSSIBLE",
-        wifiEnabled(),
-        (on) => {
-          setWifiEnabled(on);
-          if (on) startLink();
-          else stopLink();
-        },
-        "Turn off on school or office Wi-Fi.",
-      ),
-    ),
-    h("div", { class: "row-btns" }, fsBtn, stopBtn),
+  const strip = h(
+    "div",
+    { class: "strip" },
+    h("div", { class: "strip-file" }, sprite("file", 2), h("span", { class: "ellipsis" }, file.name), info),
+    h("div", { class: "strip-ctl" }, gridStep, fpsStep, fsBtn, stopBtn),
   );
-  menu.append(panel);
-  menu.onclick = (e) => e.target === menu && closeMenu();
-
-  // The pattern gets the whole window; everything else lives in a slim strip
-  // and the MENU window. Bigger pattern = bigger modules = easier to read.
-  const stripBar = h("pre", { class: "strip-bar" }, asciiBar(0, 10));
-  const stripText = h("span", { class: "strip-text" }, "STREAMING");
-  const fsMini = h("button", { class: "btn small" }, "[ ]");
-  fsMini.title = "Fullscreen";
-  fsMini.onclick = () => toggleFullscreen();
-  const menuBtn = h("button", { class: "btn small" }, "MENU");
-  menuBtn.onclick = () => (menu.hidden = false);
-  const stopMini = h("button", { class: "btn small" }, "STOP");
-  stopMini.onclick = onBack;
-  const strip = h("div", { class: "strip" }, stripBar, stripText, h("span", { class: "spacer" }), fsMini, menuBtn, stopMini);
-  const el = h("div", { class: "send-layout" }, stage, strip, menu);
+  const el = h("div", { class: "send-layout" }, stage, strip);
 
   function toggleFullscreen() {
     const p = document.fullscreenElement ? document.exitFullscreen() : el.requestFullscreen?.();
     void p?.catch(() => {});
   }
-  // Try fullscreen straight away (works when the file pick still counts as a
-  // user gesture; harmless when it doesn't).
-  void el.requestFullscreen?.().catch(() => {});
 
   // ---- grid geometry ----
   let grid = { W: 0, H: 0 };
   function stageAspect(): number {
-    const w = Math.max(1, stage.clientWidth - 16);
-    const hh = Math.max(1, stage.clientHeight - 16);
-    return hh / w;
+    return Math.max(1, stage.clientHeight - 16) / Math.max(1, stage.clientWidth - 16);
   }
   function recomputeGrid() {
     const dpr = window.devicePixelRatio || 1;
     // Never below 2 device pixels per module.
-    const maxCols = Math.floor(((stage.clientWidth - 16) * dpr) / 2) - 2 * QUIET;
-    const cols = Math.max(64, Math.min(level.cols, maxCols));
+    const maxCols = Math.floor(((Math.min(stage.clientWidth, stage.clientHeight) - 16) * dpr) / 2) - 2 * QUIET;
+    const cols = Math.max(64, Math.min(GRIDS[gridIdx]!, maxCols));
     grid = gridFor(cols, stageAspect());
+    updateInfo();
   }
-
-  function setLevel(i: number) {
-    levelIdx = Math.max(0, Math.min(LADDER.length - 1, i));
-    level = LADDER[levelIdx]!;
-    recomputeGrid();
-    lastLevelChange = performance.now();
-    sched.resetRate();
-    levelLine.textContent = `${auto ? "AUTO > " : ""}${level.label} · ${grid.W}x${grid.H} @ ${level.fps}fps · ${layout(grid.W, grid.H).blocks} blocks/frame`;
+  function updateInfo() {
+    if (!grid.W) return;
+    const rate = rawRate(grid.W, FPS[fpsIdx]!, stageAspect());
+    // One pass over the file; a receiver catching most frames needs ~1.2 passes.
+    info.textContent = `${formatBytes(file.size)} · ~${formatDuration((file.size * 1.2) / rate)} per pass`;
   }
-  const ro = new ResizeObserver(() => setLevel(levelIdx));
+  const ro = new ResizeObserver(() => recomputeGrid());
   ro.observe(stage);
-
-  // ---- Wi-Fi upgrade (optional) ----
-  let link: SenderLink | undefined;
-  let signalChunks: Uint8Array[] | undefined;
-
-  function startLink() {
-    if (link) return;
-    const l = (link = new SenderLink());
-    lWifi.set("wait", "offering");
-    l.offer()
-      .then((deflated) => {
-        if (link !== l) return;
-        const chunks: Uint8Array[] = [];
-        for (let o = 0; o < deflated.length; o += SIGNAL_CHUNK) chunks.push(deflated.subarray(o, o + SIGNAL_CHUNK));
-        signalChunks = chunks;
-      })
-      .catch(() => lWifi.set("off", "unavailable"));
-    l.dc.onopen = () => {
-      wifiOpen = true;
-      lWifi.set("on", "connected");
-      lLight.set("off", "paused");
-      wifiOverlay.hidden = false;
-      new WireSender(l.dc, sched, { t: "meta", fileId, size: file.size, name: file.name, mime: file.type }, () => {});
-    };
-    l.dc.onclose = () => {
-      wifiOpen = false;
-      if (link === l) lWifi.set("off", "lost");
-      if (!finished) lLight.set("on", "streaming");
-      wifiOverlay.hidden = true;
-    };
-    l.dc.addEventListener("message", (e) => {
-      if (typeof e.data !== "string") return;
-      const m = JSON.parse(e.data);
-      if (m.t === "progress") {
-        wifiBytes = m.bytes;
-        if (m.ack) sched.onAck(m.ack);
-        if (m.complete) finish();
-      }
-    });
-    l.pc.onconnectionstatechange = () => {
-      if (l.pc.connectionState === "connecting") lWifi.set("wait", "connecting");
-      if (l.pc.connectionState === "failed") lWifi.set("off", "not same network");
-    };
-  }
-
-  function stopLink() {
-    signalChunks = undefined;
-    link?.close();
-    link = undefined;
-    lWifi.set("off", "off");
-  }
-
-  if (wifiEnabled()) startLink();
-  else lWifi.set("off", "off");
-
-  // ---- sound back-channel ----
-  const reasm = new Reassembler();
-  const listener = new SoundListener((pkt) => {
-    const { type } = parseHeader(pkt.header);
-    if (type === MsgType.Ack) {
-      const a = parseAck(pkt.payload);
-      if (!a || a.fileIdLow !== (fileId & 0xffff)) return;
-      lSound.set("on", "receiver heard");
-      sched.onAck(a.ack);
-      onAck();
-      return;
-    }
-    const msg = reasm.push(pkt);
-    if (msg?.type === MsgType.Answer && link) {
-      const ans = decodeAnswer(msg.bytes);
-      if (ans) {
-        lWifi.set("wait", "connecting");
-        link.accept(ans).catch(() => lWifi.set("off", "failed"));
-      }
-    }
-  });
-  listener
-    .start()
-    .then(() => lSound.set("wait", "listening"))
-    .catch(() => lSound.set("off", "mic off"));
-
-  // Auto density: hill-climb on measured goodput (catch rate × raw rate of the
-  // level). A phone that can't keep up with a dense stream still gets more
-  // bytes from it, so the catch rate alone is the wrong thing to chase.
-  const goodput = new Map<number, number>();
-  let ceiling = { idx: LADDER.length, until: 0 };
-  function onAck() {
-    if (sched.finished) return finish();
-    if (!auto) return;
-    const now = performance.now();
-    if (now - lastLevelChange < 5000 || sched.rateSamples < 1) return;
-    const g = sched.rate * levelRate(level, stageAspect());
-    goodput.set(levelIdx, g);
-    const below = goodput.get(levelIdx - 1);
-    if (below !== undefined && g < below * 0.9) {
-      ceiling = { idx: levelIdx, until: now + 60000 };
-      return setLevel(levelIdx - 1);
-    }
-    const blocked = levelIdx + 1 >= ceiling.idx && now < ceiling.until;
-    if (levelIdx + 1 < LADDER.length && !blocked && sched.rate > 0.15) return setLevel(levelIdx + 1);
-    if (sched.rate < 0.05 && levelIdx > 0) setLevel(levelIdx - 1);
-  }
-
-  function finish() {
-    if (finished) return;
-    finished = true;
-    lLight.set("off", "done");
-    wifiOverlay.hidden = true;
-    doneOverlay.hidden = false;
-    bar.textContent = asciiBar(1, 18);
-    stripBar.textContent = asciiBar(1, 10);
-    stat.textContent = `Delivered ${formatBytes(file.size)}.`;
-    stripText.textContent = "DELIVERED";
-    wantAwake(false);
-  }
 
   // ---- frame production ----
   let pending: Awaited<ReturnType<Scheduler["nextBatch"]>> = [];
@@ -332,17 +151,15 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
     return pending.shift();
   }
 
-  /** Blocks for one frame: META first, the Wi-Fi offer every few frames, then data. */
+  /** One frame of blocks: a META block (name, size), then data. Small grids
+   *  carry META only every few frames so data still gets through. */
+  let frameNo = 0;
   async function buildFrame(): Promise<{ W: number; H: number; grid: Uint8Array } | null> {
     const { W, H } = grid;
     if (!W) return null;
     const n = layout(W, H).blocks;
-    const blocks: Uint8Array[] = [encodeMeta(fileId, file.size, file.name, file.type)];
-    frameNo++;
-    if (signalChunks && link && !wifiOpen && frameNo % 3 === 0) {
-      const offerId = link.offerId;
-      signalChunks.forEach((c, i, all) => blocks.push(encodeSignal(fileId, offerId, i, all.length, c)));
-    }
+    const blocks: Uint8Array[] = [];
+    if (n >= 4 || frameNo++ % 4 === 0) blocks.push(encodeMeta(fileId, file.size, file.name, file.type));
     while (blocks.length < n) {
       const b = await nextData();
       if (!b) break;
@@ -380,8 +197,6 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
   function tick(now: number) {
     if (disposed) return;
     requestAnimationFrame(tick);
-    updateStats();
-    if (wifiOpen || finished) return;
     if (!ready && !building) {
       building = true;
       void buildFrame().then((f) => {
@@ -392,38 +207,13 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
     if (!ready || now < nextAt) return;
     draw(ready);
     ready = null;
-    const interval = 1000 / level.fps;
+    const interval = 1000 / FPS[fpsIdx]!;
     nextAt = now - nextAt > interval * 2 ? now + interval : nextAt + interval;
-  }
-
-  let lastStats = 0;
-  function updateStats() {
-    const now = performance.now();
-    if (now - lastStats < 250 || finished) return;
-    lastStats = now;
-    const heard = sched.lastAckAt > 0;
-    const confirmed = Math.max(sched.ackedBytes, wifiOpen ? wifiBytes : 0);
-    rate.push(confirmed);
-    const pct = confirmed / Math.max(1, file.size);
-    bar.textContent = asciiBar(pct, 18);
-    stripBar.textContent = asciiBar(pct, 10);
-    const sound = heard ? (now - sched.lastAckAt < 12000 ? "SOUND OK" : "SOUND LOST") : "NO SOUND";
-    stripText.textContent = wifiOpen
-      ? `${formatBytes(rate.rate)}/s · WI-FI`
-      : `${heard ? `${formatBytes(rate.rate)}/s · ` : ""}${level.label} · ${sound}`;
-    if (wifiOpen) {
-      stat.textContent = `${formatBytes(rate.rate)}/s over Wi-Fi · ${formatDuration((file.size - confirmed) / rate.rate)} left`;
-    } else if (heard) {
-      stat.textContent = `${formatBytes(rate.rate)}/s confirmed · receiver catches ${Math.round(sched.rate * 100)}% of blocks`;
-    } else {
-      stat.textContent = "Streaming. Point the receiver's camera at the pattern.";
-    }
-    if (heard && now - sched.lastAckAt > 12000) lSound.set("wait", "listening");
   }
 
   wantAwake(true);
   requestAnimationFrame(() => {
-    setLevel(levelIdx);
+    recomputeGrid();
     requestAnimationFrame(tick);
   });
 
@@ -432,8 +222,7 @@ export function sendView(file: File, onBack: () => void): { el: HTMLElement; dis
     dispose() {
       disposed = true;
       ro.disconnect();
-      listener.stop();
-      link?.close();
+      if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
       wantAwake(false);
     },
   };

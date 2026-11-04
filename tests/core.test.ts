@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Scheduler } from "../src/core/scheduler.ts";
 import { Receiver, type SegmentSink } from "../src/core/receiver.ts";
-import { encodeData, encodeMeta, encodeSignal, parseFrame, FrameType, PAYLOAD_LEN } from "../src/core/frame.ts";
+import { encodeData, encodeMeta, parseFrame, FrameType, PAYLOAD_LEN } from "../src/core/frame.ts";
 import { SegmentDecoder, SegmentEncoder } from "../src/core/fountain.ts";
 import { SEG_BYTES } from "../src/core/segments.ts";
 
@@ -57,8 +57,6 @@ test("frame round trip", () => {
     assert.equal(m.mime, "image/jpeg");
     assert.equal(m.totalSize, 5_000_000_000);
   }
-  const s = parseFrame(encodeSignal(5, 77, 1, 3, new Uint8Array([1, 2, 3])));
-  assert.equal(s?.type, FrameType.Signal);
 });
 
 class MemSink implements SegmentSink {

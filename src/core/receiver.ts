@@ -1,8 +1,6 @@
-// Receiver-side state for one transfer: collects optical frames (and raw
-// segments from the Wi-Fi link), decodes segments, hands finished ones to the
-// sink, and produces the ACK the sound link sends back.
+// Receiver-side state for one transfer: collects optical blocks, decodes
+// segments, and hands finished ones to the sink.
 
-import { crc32 } from "./crc";
 import { FrameType, parseFrame, type DataFrame } from "./frame";
 import { SegmentDecoder } from "./fountain";
 import { segmentCount, segmentLength } from "./segments";
@@ -24,7 +22,6 @@ export interface TransferInfo {
 export interface ReceiverEvents {
   onLock?(info: TransferInfo): void;
   onMeta?(info: TransferInfo): void;
-  onOffer?(offerId: number, deflated: Uint8Array): void;
   onProgress?(): void;
   onComplete?(info: TransferInfo): void;
 }
@@ -47,9 +44,6 @@ export class Receiver {
   private lastUseful = 0;
   private opening?: Promise<void>;
   private pendingWrites = new Set<Promise<void>>();
-  private offers = new Map<number, (Uint8Array | undefined)[]>();
-  private seenOffer = -1;
-  private rawSegs = new Map<number, Uint8Array>();
   private haveMeta = false;
 
   constructor(
@@ -79,9 +73,6 @@ export class Receiver {
     this.bytesDone = 0;
     this.completed = false;
     this.decoders.clear();
-    this.rawSegs.clear();
-    this.offers.clear();
-    this.seenOffer = -1;
     this.opening = undefined;
     this.lastUseful = performance.now();
     this.events.onLock?.(this.info);
@@ -134,24 +125,6 @@ export class Receiver {
       }
       return;
     }
-    if (f.type === FrameType.Signal) {
-      if (this.info?.fileId !== f.fileId || f.offerId === this.seenOffer) return;
-      let parts = this.offers.get(f.offerId);
-      if (!parts || parts.length !== f.parts) this.offers.set(f.offerId, (parts = new Array(f.parts)));
-      parts[f.part] = f.chunk.slice();
-      if (Array.from(parts).every((p) => p)) {
-        this.seenOffer = f.offerId;
-        const total = parts.reduce((n, p) => n + p!.length, 0);
-        const all = new Uint8Array(total);
-        let o = 0;
-        for (const p of parts) {
-          all.set(p!, o);
-          o += p!.length;
-        }
-        this.events.onOffer?.(f.offerId, all);
-      }
-      return;
-    }
     // Data blocks don't carry the file size; they count once META has locked us on.
     if (this.info?.fileId !== f.fileId) return;
     this.onData(f);
@@ -179,22 +152,6 @@ export class Receiver {
       // Every block passed its own Reed–Solomon check, so no segment CRC here.
       this.finishSegment(f.seg, d.solve());
     }
-    this.events.onProgress?.();
-  }
-
-  /** A whole segment from the Wi-Fi link. */
-  onRawSegment(seg: number, offset: number, crc: number, chunk: Uint8Array) {
-    if (!this.info || !this.done || seg >= this.segCount || this.done[seg]) return;
-    const len = segmentLength(this.info.totalSize, seg);
-    let buf = this.rawSegs.get(seg);
-    if (!buf) this.rawSegs.set(seg, (buf = new Uint8Array(len)));
-    buf.set(chunk.subarray(0, Math.max(0, len - offset)), offset);
-    if (offset + chunk.length < len) return;
-    this.rawSegs.delete(seg);
-    this.lastUseful = performance.now();
-    if (crc32(buf) !== crc) return;
-    this.decoders.delete(seg);
-    this.finishSegment(seg, buf);
     this.events.onProgress?.();
   }
 
@@ -238,14 +195,6 @@ export class Receiver {
         this.events.onComplete?.(info);
       }
     });
-  }
-
-  /** Segments still missing, in order (for the Wi-Fi link's "need" request). */
-  missing(limit = 512): number[] {
-    const out: number[] = [];
-    if (!this.done) return out;
-    for (let s = 0; s < this.segCount && out.length < limit; s++) if (!this.done[s]) out.push(s);
-    return out;
   }
 
   ack(): Ack | undefined {

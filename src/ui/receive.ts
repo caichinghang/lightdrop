@@ -1,12 +1,8 @@
 import { Receiver, type TransferInfo } from "../core/receiver";
-import { SoundTalker, audioContext } from "../audio/io";
-import { MsgType, ackPacket, fragmentPackets } from "../audio/messages";
-import { ReceiverLink } from "../net/rtc";
-import { WireReceiver } from "../net/wire";
 import { FileSink } from "../storage/store";
 import { WorkerPool } from "../workers/pool";
 import { asciiBar, sprite } from "./pixels";
-import { RateMeter, formatBytes, formatDuration, h, isTouch, setWifiEnabled, statusLine, wantAwake, wifiEnabled, win } from "./util";
+import { RateMeter, formatBytes, formatDuration, h, isTouch, wantAwake, win } from "./util";
 
 interface DecodeRes {
   id: number;
@@ -20,27 +16,15 @@ interface DecodeRes {
   error?: string;
 }
 
-const ACK_EVERY_MS = 2500;
-/** Give up offering Wi-Fi after this long (networks that block peers never connect). */
-const WIFI_GIVE_UP_MS = 30000;
-/** Scans per second: full speed with the pattern in view, slow while searching.
- *  This, plus two workers on phones, keeps the phone from heating up. */
+/** Scans per second: full speed with the pattern in view, slow while searching
+ *  (keeps the phone cool). */
 const SCAN_FPS_LOCKED = 30;
-const SCAN_FPS_SEARCHING = 6;
+const SCAN_FPS_SEARCHING = 8;
 
 export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () => void } {
-  // Called from the tap that opened this view: unlocks audio on iOS.
-  audioContext();
   let disposed = false;
   let stream: MediaStream | undefined;
-  let wire: WireReceiver | undefined;
-  let rtc: ReceiverLink | undefined;
-  let answerPackets: Uint8Array[] | undefined;
-  let answerSince = 0;
-  let useWifi = wifiEnabled();
-  let wifiOpen = false;
   let lastDecodeAt = 0;
-  const talker = new SoundTalker();
   const sink = new FileSink();
   const meter = new RateMeter(4000);
 
@@ -53,7 +37,7 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
   // video (CSS filters on <video> aren't honoured everywhere). The whole frame
   // is decoded, so there is no aiming box: the pattern can be anywhere.
   const preview = h("canvas", { class: "camera-preview" }) as HTMLCanvasElement;
-  const hintEl = h("div", { class: "aim-hint" }, "POINT THE CAMERA AT THE PATTERN. ANYWHERE IN VIEW WORKS.");
+  const hintEl = h("div", { class: "aim-hint" }, "POINT THE CAMERA AT THE PATTERN ON THE OTHER SCREEN.");
   const closeBtn = h("button", { class: "btn cam-close" }, "< BACK");
   closeBtn.onclick = onBack;
   const cam = h("div", { class: "camera-wrap" }, video, preview, overlay, closeBtn, hintEl);
@@ -61,51 +45,13 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
   const nameEl = h("strong", { class: "ellipsis" }, "SEARCHING...");
   const subEl = h("span", {}, "");
   const bar = h("pre", { class: "bar" }, asciiBar(0, 18));
-  const lLight = statusLine("LIGHT");
-  const lSound = statusLine("SOUND");
-  const lWifi = statusLine("WI-FI");
-  lLight.el.classList.add("compact");
-  lSound.el.classList.add("compact");
-  lWifi.el.classList.add("compact");
-  lLight.set("wait", "searching");
-  lSound.set("wait", "ready");
   const diag = h("div", { class: "diag" }, "starting camera...");
-
-  let soundOn = true;
-  const soundBtn = h("button", { class: "linkish" }, "[MUTE SOUND]");
-  soundBtn.onclick = () => {
-    soundOn = !soundOn;
-    soundBtn.textContent = soundOn ? "[MUTE SOUND]" : "[UNMUTE SOUND]";
-    lSound.set(soundOn ? "wait" : "off", soundOn ? "ready" : "muted");
-  };
-  const wifiBtn = h("button", { class: "linkish" });
-  const syncWifi = () => {
-    wifiBtn.textContent = useWifi ? "[WI-FI OFF]" : "[WI-FI ON]";
-    if (!useWifi) lWifi.set("off", "off");
-    else if (!rtc) lWifi.set("wait", "waiting");
-  };
-  wifiBtn.onclick = () => {
-    useWifi = !useWifi;
-    setWifiEnabled(useWifi);
-    if (!useWifi) {
-      answerPackets = undefined;
-      if (!wifiOpen) {
-        rtc?.close();
-        rtc = undefined;
-      }
-    }
-    syncWifi();
-  };
-  syncWifi();
-
   const sheet = win(
     "RECEIVING",
     { cls: "win-sheet" },
     h("div", { class: "file-row" }, sprite("file", 3), h("div", { class: "file-meta" }, nameEl, subEl)),
     bar,
-    h("div", { class: "lines row" }, lLight.el, lSound.el, lWifi.el),
     diag,
-    h("div", { class: "row-links" }, soundBtn, wifiBtn),
   );
   const result = h("div", { class: "result", hidden: true });
   const el = h("div", { class: "receive-layout" }, cam, sheet, result);
@@ -115,82 +61,14 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     onLock(info) {
       nameEl.textContent = "RECEIVING...";
       subEl.textContent = formatBytes(info.totalSize);
-      hintEl.hidden = true;
-      lLight.set("on", "reading");
     },
     onMeta(info) {
       nameEl.textContent = info.name;
-    },
-    onOffer(offerId, deflated) {
-      if (rtc || !useWifi) return;
-      rtc = new ReceiverLink();
-      rtc.onChannel = (dc) => {
-        dc.onopen = () => onWifi(dc);
-        if (dc.readyState === "open") onWifi(dc);
-      };
-      rtc.pc.onconnectionstatechange = () => {
-        const s = rtc?.pc.connectionState;
-        if (s === "connecting") lWifi.set("wait", "connecting");
-        if (s === "failed") {
-          lWifi.set("off", "not same network");
-          answerPackets = undefined;
-        }
-      };
-      rtc
-        .answer(offerId, deflated)
-        .then((bytes) => {
-          if (!useWifi) return;
-          answerPackets = fragmentPackets(MsgType.Answer, offerId & 0xff, bytes);
-          answerSince = performance.now();
-          lWifi.set("wait", "offering");
-        })
-        .catch(() => lWifi.set("off", "unavailable"));
     },
     onComplete(info) {
       void showResult(info);
     },
   });
-
-  function onWifi(dc: RTCDataChannel) {
-    if (wire) return;
-    wifiOpen = true;
-    lWifi.set("on", "connected");
-    lSound.set("off", "not needed");
-    wire = new WireReceiver(dc, rx, () => {});
-    const timer = setInterval(() => {
-      if (dc.readyState !== "open") return clearInterval(timer);
-      dc.send(JSON.stringify({ t: "progress", bytes: rx.bytesDone, ack: rx.ack(), complete: rx.completed }));
-      if (rx.completed) clearInterval(timer);
-    }, 500);
-    dc.onclose = () => {
-      wifiOpen = false;
-      wire?.stop();
-      wire = undefined;
-      lWifi.set("off", "lost");
-    };
-  }
-
-  // ---- sound back-channel ----
-  let finalAcks = 0;
-  async function talkLoop() {
-    while (!disposed) {
-      const started = performance.now();
-      const ack = rx.ack();
-      if (soundOn && !wifiOpen && rx.info && ack && (!rx.completed || finalAcks < 3)) {
-        if (rx.completed) finalAcks++;
-        const packets = [ackPacket(rx.info.fileId, ack)];
-        if (answerPackets && performance.now() - answerSince > WIFI_GIVE_UP_MS) {
-          // Never connected: this network keeps devices apart. Stop spending sound on it.
-          answerPackets = undefined;
-          lWifi.set("off", "not same network");
-        }
-        if (answerPackets) packets.push(...answerPackets);
-        lSound.set("on", "talking");
-        await talker.say(packets);
-      }
-      await new Promise((r) => setTimeout(r, Math.max(400, ACK_EVERY_MS - (performance.now() - started))));
-    }
-  }
 
   // ---- camera ----
   const decoders = new WorkerPool<object, DecodeRes>(
@@ -201,9 +79,11 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
   let scans = 0;
   let blocksSeen = 0;
   let blocksTotal = 0;
+  let framesFound = 0;
   let decodeMs = 0;
   let gridSeen = "";
   let grabError = "";
+  let mirrored = false;
 
   async function startCamera() {
     try {
@@ -212,8 +92,7 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
         video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
       });
     } catch {
-      hintEl.textContent = "CAMERA ACCESS IS NEEDED. ALLOW IT IN YOUR BROWSER SETTINGS AND TRY AGAIN.";
-      hintEl.classList.add("error");
+      setHint("CAMERA ACCESS IS NEEDED. ALLOW IT IN YOUR BROWSER SETTINGS AND TRY AGAIN.", true);
       return;
     }
     if (disposed) return stream.getTracks().forEach((t) => t.stop());
@@ -222,12 +101,37 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     const track = stream.getVideoTracks()[0];
     const st = track?.getSettings();
     camInfo = st ? `${st.width}x${st.height}@${Math.round(st.frameRate ?? 0)}` : "";
-    const caps = (track?.getCapabilities?.() ?? {}) as MediaTrackCapabilities & { focusMode?: string[] };
-    if (caps.focusMode?.includes("continuous")) {
-      await track!.applyConstraints({ advanced: [{ focusMode: "continuous" } as MediaTrackConstraintSet] }).catch(() => {});
-    }
+    // A laptop webcam faces you: show it like a mirror so moving the phone
+    // left moves it left on screen. (Decoding always uses the real image.)
+    mirrored = st?.facingMode === "user" || (!st?.facingMode && !isTouch());
+    preview.classList.toggle("mirror", mirrored);
+    overlay.classList.toggle("mirror", mirrored);
+    await tuneCamera(track);
     grabLoop();
     previewLoop();
+  }
+
+  /**
+   * A bright screen in a darker room gets over-exposed: white bleeds into the
+   * black squares and the exposure gets long enough to blend two patterns.
+   * Where the browser lets us, ask for a darker, continuously focused image.
+   */
+  async function tuneCamera(track: MediaStreamTrack | undefined) {
+    if (!track?.getCapabilities) return;
+    const caps = track.getCapabilities() as MediaTrackCapabilities & {
+      focusMode?: string[];
+      exposureCompensation?: { min: number; max: number; step: number };
+      exposureMode?: string[];
+    };
+    const adv: Record<string, unknown> = {};
+    if (caps.focusMode?.includes("continuous")) adv.focusMode = "continuous";
+    if (caps.exposureMode?.includes("continuous")) adv.exposureMode = "continuous";
+    const ec = caps.exposureCompensation;
+    if (ec && ec.min < 0) {
+      const step = ec.step || 1;
+      adv.exposureCompensation = Math.max(ec.min, Math.round(-1 / step) * step);
+    }
+    if (Object.keys(adv).length) await track.applyConstraints({ advanced: [adv as MediaTrackConstraintSet] }).catch(() => {});
   }
 
   // ---- 1-bit preview ----
@@ -343,6 +247,7 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     decodeMs = decodeMs ? decodeMs * 0.8 + r.ms * 0.2 : r.ms;
     blocksSeen += r.blocks.length;
     blocksTotal += r.total;
+    if (r.quad) framesFound++;
     if (r.grid) gridSeen = r.grid;
     for (const b of r.blocks) rx.onFrame(b);
     if (r.blocks.length) lastDecodeAt = performance.now();
@@ -374,35 +279,70 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     octx.stroke();
   }
 
+  // ---- guidance ----
+  // No back-channel to the sender, so the receiver tells the person what to
+  // change on it, based on what the last few seconds looked like.
+  function setHint(text: string, error = false) {
+    hintEl.textContent = text;
+    hintEl.hidden = !text;
+    hintEl.classList.toggle("error", error);
+  }
+  const history: { scans: number; found: number; ok: number; total: number }[] = [];
+  function advise() {
+    if (hintEl.classList.contains("error")) return;
+    const w = history.slice(-3);
+    const scansN = w.reduce((s, x) => s + x.scans, 0);
+    if (scansN < 6) return;
+    const found = w.reduce((s, x) => s + x.found, 0) / scansN;
+    const ok = w.reduce((s, x) => s + x.ok, 0);
+    const total = w.reduce((s, x) => s + x.total, 0);
+    const okRate = total ? ok / total : 0;
+    if (found < 0.2) {
+      setHint(
+        mirrored
+          ? "CAN'T SEE THE PATTERN. HOLD THE PHONE 20-40 CM FROM THE CAMERA, WITH ALL FOUR CORNER SQUARES IN VIEW."
+          : "CAN'T SEE THE PATTERN. GET ALL FOUR CORNER SQUARES IN VIEW.",
+      );
+    } else if (okRate < 0.25) {
+      setHint("PATTERN FOUND BUT NOT READABLE. ON THE SENDER PRESS GRID - (BIGGER SQUARES) OR FPS - (SLOWER). HOLD STEADY.");
+    } else if (okRate < 0.6) {
+      setHint("READING SOME OF IT. FPS - ON THE SENDER, OR HOLDING STEADIER, WILL SPEED THIS UP.");
+    } else if (okRate > 0.95 && w.length === 3) {
+      setHint("READING EVERYTHING. FOR MORE SPEED, TRY GRID + ON THE SENDER.");
+    } else {
+      setHint("");
+    }
+  }
+
   // ---- stats ----
   let lastDiagAt = performance.now();
   let lastScans = 0;
   let lastBlocks = 0;
   let lastTotal = 0;
+  let lastFound = 0;
   const statsTimer = setInterval(() => {
     const t = performance.now();
     if (t - lastDiagAt >= 1000) {
       const dt = (t - lastDiagAt) / 1000;
-      const scanRate = (scans - lastScans) / dt;
-      const okDelta = blocksSeen - lastBlocks;
-      const totDelta = blocksTotal - lastTotal;
+      const sample = { scans: scans - lastScans, found: framesFound - lastFound, ok: blocksSeen - lastBlocks, total: blocksTotal - lastTotal };
+      history.push(sample);
+      if (history.length > 5) history.shift();
       lastDiagAt = t;
       lastScans = scans;
       lastBlocks = blocksSeen;
       lastTotal = blocksTotal;
+      lastFound = framesFound;
       diag.textContent = [
         camInfo && `cam ${camInfo}`,
-        `${scanRate.toFixed(0)} scan/s ${decodeMs.toFixed(0)}ms`,
+        `${(sample.scans / dt).toFixed(0)} scan/s ${decodeMs.toFixed(0)}ms`,
         gridSeen && `grid ${gridSeen}`,
-        `${(okDelta / dt).toFixed(0)} blk/s${totDelta ? ` ${Math.round((okDelta / totDelta) * 100)}% ok` : ""}`,
+        `${(sample.ok / dt).toFixed(0)} blk/s${sample.total ? ` ${Math.round((sample.ok / sample.total) * 100)}% ok` : ""}`,
         bitmapOk ? "" : "readback",
         grabError && `err: ${grabError.slice(0, 60)}`,
       ]
         .filter(Boolean)
         .join(" | ");
-    }
-    if (!rx.info && scans > 60 && blocksSeen === 0 && !hintEl.classList.contains("error")) {
-      hintEl.textContent = "NOTHING READ YET. MOVE CLOSER SO THE PATTERN FILLS THE BRACKETS, HOLD STEADY, OR LOWER THE DENSITY ON THE SENDER.";
+      if (!rx.completed) advise();
     }
     if (!rx.info || rx.completed) return;
     const pct = rx.smoothProgress;
@@ -412,9 +352,6 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     const r = meter.rate;
     const left = (rx.info.totalSize - doneBytes) / r;
     subEl.textContent = `${formatBytes(doneBytes)} / ${formatBytes(rx.info.totalSize)}${r > 0 ? ` · ${formatBytes(r)}/s · ${formatDuration(left)} left` : ""}`;
-    const seeing = performance.now() - lastDecodeAt < 1000;
-    if (!wifiOpen) lLight.set(seeing ? "on" : "wait", seeing ? "reading" : "searching");
-    else lLight.set("off", "paused");
   }, 250);
 
   async function showResult(info: TransferInfo) {
@@ -427,7 +364,7 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
     const share = h("button", { class: "btn" }, "SHARE...");
     share.onclick = () => navigator.share?.({ files: [file] }).catch(() => {});
     const canShare = !!navigator.canShare?.({ files: [file] });
-    const preview = file.type.startsWith("image/")
+    const shown = file.type.startsWith("image/")
       ? h("img", { class: "preview", src: url, alt: "" })
       : file.type.startsWith("video/")
         ? h("video", { class: "preview", src: url, controls: true, playsinline: true })
@@ -438,9 +375,9 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
       win(
         "TRANSFER COMPLETE",
         { onClose: onBack, cls: "win-result" },
-        h("div", { class: "result-art" }, sprite("face", 5), preview),
+        h("div", { class: "result-art" }, sprite("face", 5), shown),
         h("strong", { class: "ellipsis center" }, info.name),
-        h("span", { class: "center" }, `${formatBytes(info.totalSize)} · verified`),
+        h("span", { class: "center" }, `${formatBytes(info.totalSize)} · verified · you can stop the sender`),
         h("div", { class: "col-btns" }, save, canShare ? share : null, again),
       ),
     );
@@ -450,7 +387,6 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
 
   wantAwake(true);
   void startCamera();
-  void talkLoop();
 
   return {
     el,
@@ -459,8 +395,6 @@ export function receiveView(onBack: () => void): { el: HTMLElement; dispose: () 
       clearInterval(statsTimer);
       stream?.getTracks().forEach((t) => t.stop());
       decoders.terminate();
-      wire?.stop();
-      rtc?.close();
       wantAwake(false);
     },
   };

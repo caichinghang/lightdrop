@@ -1,32 +1,25 @@
-// Stream density presets: how many modules across the screen, and how many
-// frames per second. Block size never changes, so switching levels mid-
-// transfer loses nothing.
+// Stream settings. There is no back-channel, so the person sending picks
+// these (the receiver screen says which way to go). Block size never changes,
+// so adjusting mid-transfer loses nothing.
 
 import { PAYLOAD_LEN } from "./frame";
 import { gridFor, layout } from "../optical/layout";
 
-export interface Level {
-  cols: number;
-  fps: number;
-  label: string;
+/** Modules across the pattern: fewer = bigger squares = easier to read. */
+export const GRIDS = [64, 80, 96, 128, 160, 192, 224, 256, 296, 336];
+
+/** Pattern changes per second. Slower lets a camera in a dim room (long
+ *  exposure) catch each pattern cleanly instead of a blend of two. */
+export const FPS = [6, 8, 10, 12, 15, 20, 24, 30];
+
+/** Phones usually send to a laptop webcam: coarse and slow. Computers usually
+ *  send to a phone camera, which resolves much finer patterns. */
+export function defaults(isPhone: boolean): { grid: number; fps: number } {
+  return isPhone ? { grid: GRIDS.indexOf(80), fps: FPS.indexOf(10) } : { grid: GRIDS.indexOf(224), fps: FPS.indexOf(15) };
 }
 
-/** The auto ladder, slowest to fastest. */
-export const LADDER: Level[] = [
-  { cols: 96, fps: 12, label: "GENTLE" },
-  { cols: 128, fps: 15, label: "EASY" },
-  { cols: 160, fps: 20, label: "STEADY" },
-  { cols: 192, fps: 24, label: "NORMAL" },
-  { cols: 224, fps: 30, label: "QUICK" },
-  { cols: 256, fps: 30, label: "FAST" },
-  { cols: 296, fps: 30, label: "FASTER" },
-  { cols: 336, fps: 30, label: "TURBO" },
-  { cols: 384, fps: 30, label: "HYPER" },
-  { cols: 448, fps: 30, label: "MAX" },
-];
-
-/** Raw optical bytes per second a level pushes on a stage of this aspect (h/w). */
-export function levelRate(l: Level, aspect: number): number {
-  const { W, H } = gridFor(l.cols, aspect);
-  return layout(W, H).blocks * PAYLOAD_LEN * l.fps;
+/** Raw bytes per second for a grid on a stage of this aspect (height / width). */
+export function rawRate(cols: number, fps: number, aspect: number): number {
+  const { W, H } = gridFor(cols, aspect);
+  return layout(W, H).blocks * PAYLOAD_LEN * fps;
 }

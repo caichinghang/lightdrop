@@ -9,7 +9,10 @@ window.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 8
 delete (HTMLVideoElement.prototype as any).requestVideoFrameCallback;
 
 const size = Number(new URLSearchParams(location.search).get("size") ?? 1_000_000);
-const level = new URLSearchParams(location.search).get("level");
+// ?grid=<index into GRIDS>&fps=<index into FPS> (desktop sender settings)
+const q = new URLSearchParams(location.search);
+if (q.get("grid")) localStorage.setItem("lightdrop.grid.desk", q.get("grid")!);
+if (q.get("fps")) localStorage.setItem("lightdrop.fps.desk", q.get("fps")!);
 const bytes = new Uint8Array(size);
 for (let i = 0; i < size; i += 65536) crypto.getRandomValues(bytes.subarray(i, i + 65536));
 const file = new File([bytes], `e2e-${size}.bin`, { lastModified: Date.now() });
@@ -18,12 +21,8 @@ const senderBox = document.createElement("div");
 senderBox.style.cssText = "position:fixed;left:0;top:0;width:1400px;height:820px;overflow:hidden;opacity:0.01;pointer-events:none";
 document.body.append(senderBox);
 const s = sendView(file, () => {});
+s.el.style.height = "820px"; // the preview pane may be hidden, where 100dvh is 0
 senderBox.append(s.el);
-if (level) {
-  const sel = s.el.querySelector("select") as HTMLSelectElement;
-  sel.value = level;
-  sel.dispatchEvent(new Event("change"));
-}
 const qr = s.el.querySelector("canvas.code") as HTMLCanvasElement;
 
 const cam = document.createElement("canvas");
@@ -56,5 +55,6 @@ const t0 = performance.now();
   diag: r.el.querySelector(".diag")?.textContent,
   sub: r.el.querySelector(".file-meta span")?.textContent,
   done: !r.el.querySelector(".result")?.hasAttribute("hidden"),
-  sender: s.el.querySelector(".level")?.textContent,
+  sender: s.el.querySelector(".strip")?.textContent,
+  hint: r.el.querySelector(".aim-hint")?.textContent,
 });

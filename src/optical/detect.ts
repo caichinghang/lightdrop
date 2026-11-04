@@ -91,29 +91,72 @@ function downscale(g: Gray, f: number): Gray {
   return { data: out, w, h };
 }
 
+/**
+ * Local min/max threshold (in the spirit of zxing's hybrid binarizer): each
+ * pixel is compared with the midpoint of the darkest and brightest values
+ * around it. Unlike a local *mean*, this isn't dragged down by a dark room
+ * around a bright screen, which otherwise turns the screen's black squares
+ * "white" at the pattern's edges.
+ */
 function binarize(g: Gray, radius?: number): Uint8Array {
   const { w, h, data } = g;
-  const W1 = w + 1;
-  const integral = new Float64Array(W1 * (h + 1));
+  const B = 8;
+  const bw = Math.ceil(w / B);
+  const bh = Math.ceil(h / B);
+  const mn = new Uint8Array(bw * bh).fill(255);
+  const mx = new Uint8Array(bw * bh);
+  let gmin = 255;
+  let gmax = 0;
   for (let y = 0; y < h; y++) {
-    let row = 0;
+    const brow = ((y / B) | 0) * bw;
     for (let x = 0; x < w; x++) {
-      row += data[y * w + x]!;
-      integral[(y + 1) * W1 + x + 1] = integral[y * W1 + x + 1]! + row;
+      const v = data[y * w + x]!;
+      const bi = brow + ((x / B) | 0);
+      if (v < mn[bi]!) mn[bi] = v;
+      if (v > mx[bi]!) mx[bi] = v;
     }
   }
-  const r = radius ?? Math.max(8, Math.round(Math.max(w, h) / 16));
+  for (let i = 0; i < mn.length; i++) {
+    if (mn[i]! < gmin) gmin = mn[i]!;
+    if (mx[i]! > gmax) gmax = mx[i]!;
+  }
+  // Spread min/max over a neighbourhood of blocks (separable).
+  const nb = Math.max(1, Math.round((radius ?? Math.max(16, Math.max(w, h) / 16)) / B));
+  const spread = (src: Uint8Array, pickMin: boolean) => {
+    const tmp = new Uint8Array(src.length);
+    const out = new Uint8Array(src.length);
+    for (let by = 0; by < bh; by++)
+      for (let bx = 0; bx < bw; bx++) {
+        let v = pickMin ? 255 : 0;
+        for (let k = Math.max(0, bx - nb); k <= Math.min(bw - 1, bx + nb); k++) {
+          const u = src[by * bw + k]!;
+          v = pickMin ? Math.min(v, u) : Math.max(v, u);
+        }
+        tmp[by * bw + bx] = v;
+      }
+    for (let by = 0; by < bh; by++)
+      for (let bx = 0; bx < bw; bx++) {
+        let v = pickMin ? 255 : 0;
+        for (let k = Math.max(0, by - nb); k <= Math.min(bh - 1, by + nb); k++) {
+          const u = tmp[k * bw + bx]!;
+          v = pickMin ? Math.min(v, u) : Math.max(v, u);
+        }
+        out[by * bw + bx] = v;
+      }
+    return out;
+  };
+  const lo = spread(mn, true);
+  const hi = spread(mx, false);
+  const gmid = (gmin + gmax) / 2;
+  // Regions with little contrast (a dark room's sensor noise) are flat
+  // background, not pattern: compare them with the global midpoint instead.
+  const minContrast = Math.max(24, (gmax - gmin) * 0.25);
+  const thr = new Float32Array(bw * bh);
+  for (let i = 0; i < thr.length; i++) thr[i] = hi[i]! - lo[i]! >= minContrast ? (lo[i]! + hi[i]!) / 2 : gmid;
   const bin = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
-    const y0 = Math.max(0, y - r);
-    const y1 = Math.min(h, y + r + 1);
-    for (let x = 0; x < w; x++) {
-      const x0 = Math.max(0, x - r);
-      const x1 = Math.min(w, x + r + 1);
-      const sum = integral[y1 * W1 + x1]! - integral[y0 * W1 + x1]! - integral[y1 * W1 + x0]! + integral[y0 * W1 + x0]!;
-      const mean = sum / ((x1 - x0) * (y1 - y0));
-      bin[y * w + x] = data[y * w + x]! < mean - 2 ? 1 : 0;
-    }
+    const brow = ((y / B) | 0) * bw;
+    for (let x = 0; x < w; x++) bin[y * w + x] = data[y * w + x]! < thr[brow + ((x / B) | 0)]! ? 1 : 0;
   }
   return bin;
 }
@@ -288,8 +331,10 @@ function refineCentre(g: Gray, c: Candidate): Pt {
 }
 
 function pickQuad(cands: Candidate[]): Candidate[] | null {
+  // Real finders are hit by many scan rows; chance look-alikes by one or two.
+  const top = Math.max(...cands.map((c) => c.count), 0);
   const pool = cands
-    .filter((c) => c.count >= 2 || cands.length <= 4)
+    .filter((c) => c.count >= Math.max(2, top * 0.25) || cands.length <= 4)
     .sort((a, b) => b.count - a.count)
     .slice(0, 10);
   if (pool.length < 4) return null;

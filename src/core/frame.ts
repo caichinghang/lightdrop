@@ -7,7 +7,6 @@
 //
 // DATA   (type 1)  4 u24 seg · 7 u16 seq · 9 payload (212 bytes)
 // META   (type 2)  4 u48 totalSize · 10 u8 nameLen · name · u8 mimeLen · mime
-// SIGNAL (type 3)  4 u16 offerId · 6 u8 part · 7 u8 parts · 8 u8 len · 9 deflated SDP chunk
 
 import { BLOCK_DATA } from "../optical/layout";
 
@@ -15,12 +14,10 @@ export const VERSION = 2;
 export const DATA_HEADER = 9;
 /** Fountain block size: fixed, whatever the stream density. */
 export const PAYLOAD_LEN = 212;
-export const SIGNAL_CHUNK = BLOCK_DATA - 9;
 
 export const enum FrameType {
   Data = 1,
   Meta = 2,
-  Signal = 3,
 }
 
 export interface DataFrame {
@@ -37,15 +34,7 @@ export interface MetaFrame {
   name: string;
   mime: string;
 }
-export interface SignalFrame {
-  type: FrameType.Signal;
-  fileId: number;
-  offerId: number;
-  part: number;
-  parts: number;
-  chunk: Uint8Array;
-}
-export type Frame = DataFrame | MetaFrame | SignalFrame;
+export type Frame = DataFrame | MetaFrame;
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -100,17 +89,6 @@ function truncateUtf8(s: string, maxBytes: number): string {
   return base + "…" + ext;
 }
 
-export function encodeSignal(fileId: number, offerId: number, part: number, parts: number, chunk: Uint8Array): Uint8Array {
-  const out = header(FrameType.Signal, fileId);
-  out[4] = offerId & 0xff;
-  out[5] = offerId >>> 8;
-  out[6] = part;
-  out[7] = parts;
-  out[8] = chunk.length;
-  out.set(chunk.subarray(0, SIGNAL_CHUNK), 9);
-  return out;
-}
-
 export function parseFrame(bytes: Uint8Array): Frame | null {
   if (bytes.length < BLOCK_DATA || bytes[0]! >> 4 !== VERSION) return null;
   const type = bytes[0]! & 0x0f;
@@ -130,11 +108,6 @@ export function parseFrame(bytes: Uint8Array): Frame | null {
       name: dec.decode(bytes.subarray(11, 11 + nameLen)),
       mime: dec.decode(bytes.subarray(12 + nameLen, 12 + nameLen + mimeLen)),
     };
-  }
-  if (type === FrameType.Signal) {
-    const len = bytes[8]!;
-    if (bytes[7] === 0 || len > SIGNAL_CHUNK) return null;
-    return { type, fileId, offerId: bytes[4]! | (bytes[5]! << 8), part: bytes[6]!, parts: bytes[7]!, chunk: bytes.subarray(9, 9 + len) };
   }
   return null;
 }

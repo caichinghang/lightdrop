@@ -752,3 +752,65 @@ canvas.code {
     outline: none;
   }
 }
+
+/* ---------------------------------------------------------------- one-way strip */
+
+.strip {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+.strip-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 220px;
+}
+.strip-file .ellipsis {
+  max-width: 40vw;
+}
+.strip-ctl {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.st-label {
+  font-family: var(--display);
+  font-size: 12px;
+  margin-right: 2px;
+}
+.st-value {
+  min-width: 2.2em;
+  text-align: center;
+  font-size: 22px;
+}
+.st-btn {
+  min-width: 34px;
+  padding: 0 6px;
+  font-size: 18px;
+}
+.st-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+@media (max-width: 520px) {
+  .strip-file {
+    display: none;
+  }
+  .strip {
+    justify-content: center;
+  }
+  .strip-ctl {
+    gap: 8px;
+    justify-content: center;
+  }
+}
+.mirror {
+  transform: scaleX(-1);
+}
